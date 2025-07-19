@@ -258,7 +258,9 @@ func (c *Connection) handleFrame(frame wire.Frame) {
 		log.Printf("[RECV] Got ACK frame.")
 		if !c.handshakeComplete {
 			c.handshakeComplete = true
-			close(c.handshakeCompleteChan)
+			if c.isClient {
+				close(c.handshakeCompleteChan)
+			}
 		}
 		_, err := c.sentPacketHandler.ReceivedAck(f, protocol.EncryptionInitial, time.Now())
 		if err != nil {
@@ -311,14 +313,11 @@ func (c *Connection) sendPacket(frames []wire.Frame) error {
 	var pn protocol.PacketNumber
 	var pnLen protocol.PacketNumberLen
 	var encLevel protocol.EncryptionLevel
-	var sealer handshake.LongHeaderSealer
 
 	if !c.handshakeComplete {
 		encLevel = protocol.EncryptionInitial
-		sealer = c.longHeaderSealer
 	} else {
 		encLevel = protocol.Encryption1RTT
-		sealer = c.shortHeaderSealer
 	}
 
 	pn, pnLen = c.sentPacketHandler.PeekPacketNumber(encLevel)
@@ -328,12 +327,16 @@ func (c *Connection) sendPacket(frames []wire.Frame) error {
 	defer putPacketBuffer(payloadBuf)
 
 	var ackhandlerFrames []ackhandler.Frame
+	var finalFrames []wire.Frame
 	for _, frame := range frames {
-		// Enforce the protocol rule: No STREAM frames in Initial packets.
 		if _, isStream := frame.(*wire.StreamFrame); isStream && encLevel == protocol.EncryptionInitial {
 			log.Printf("[SEND] Dropping STREAM frame, handshake not complete.")
 			continue
 		}
+		finalFrames = append(finalFrames, frame)
+	}
+
+	for _, frame := range finalFrames {
 		b, err := frame.Append(payloadBuf.Bytes(), protocol.Version1)
 		if err != nil {
 			return err
@@ -347,7 +350,34 @@ func (c *Connection) sendPacket(frames []wire.Frame) error {
 		return nil // Nothing to send
 	}
 
-	// Let the ackhandler know what we're sending.
+	var raw []byte
+	var err error
+	var overhead int
+	var sealer handshake.LongHeaderSealer
+
+	if encLevel == protocol.EncryptionInitial {
+		sealer = c.longHeaderSealer
+		overhead = sealer.Overhead()
+		hdr := &wire.ExtendedHeader{
+			Header: wire.Header{
+				Type:             protocol.PacketTypeInitial,
+				DestConnectionID: c.destConnID,
+				SrcConnectionID:  c.destConnID, // Should be a different ID
+				Length:           protocol.ByteCount(payloadBuf.Len() + int(pnLen) + overhead),
+				Version:          protocol.Version1,
+			},
+			PacketNumber:    pn,
+			PacketNumberLen: pnLen,
+		}
+		raw, err = hdr.Append(nil, protocol.Version1)
+	} else {
+		sealer = c.shortHeaderSealer
+		raw, err = wire.AppendShortHeader(nil, c.destConnID, pn, pnLen, c.shortHeaderSealer.KeyPhase())
+	}
+	if err != nil {
+		return err
+	}
+
 	c.sentPacketHandler.SentPacket(
 		time.Now(),
 		pn,
@@ -356,32 +386,10 @@ func (c *Connection) sendPacket(frames []wire.Frame) error {
 		ackhandlerFrames,
 		encLevel,
 		protocol.ECNUnsupported,
-		protocol.ByteCount(payloadBuf.Len()),
+		protocol.ByteCount(payloadBuf.Len()+len(raw)+overhead),
 		false,
 		false,
 	)
-
-	var raw []byte
-	var err error
-	if encLevel == protocol.EncryptionInitial {
-		hdr := &wire.ExtendedHeader{
-			Header: wire.Header{
-				Type:             protocol.PacketTypeInitial,
-				DestConnectionID: c.destConnID,
-				SrcConnectionID:  c.destConnID, // Should be a different ID
-				Length:           protocol.ByteCount(payloadBuf.Len() + int(pnLen) + sealer.Overhead()),
-				Version:          protocol.Version1,
-			},
-			PacketNumber:    pn,
-			PacketNumberLen: pnLen,
-		}
-		raw, err = hdr.Append(nil, protocol.Version1)
-	} else {
-		raw, err = wire.AppendShortHeader(nil, c.destConnID, pn, pnLen, c.shortHeaderSealer.KeyPhase())
-	}
-	if err != nil {
-		return err
-	}
 
 	payload := sealer.Seal(nil, payloadBuf.Bytes(), pn, raw)
 	raw = append(raw, payload...)
