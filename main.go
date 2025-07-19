@@ -5,13 +5,14 @@ import (
 	"io"
 	"log"
 	"time"
+
+	"github.com/dozyio/quic-buffer-go/wire"
 )
 
 func main() {
 	log.Println("--- Starting QUIC-like protocol demo ---")
 
 	// Create a buffered, in-memory transport pipe.
-	// What client writes, server can read, and vice-versa.
 	clientTransport, serverTransport := newInMemoryTransportPair()
 
 	// Use a context for cancellation
@@ -25,11 +26,10 @@ func main() {
 	var server *Connection
 	go func() {
 		defer func() { done <- struct{}{} }()
-		server, serverErr = NewConnection(serverTransport, false) // isClient = false
+		server, serverErr = NewConnection(serverTransport, false)
 		if serverErr != nil {
 			return
 		}
-		// The server runs its main loop until the context is cancelled or an error occurs.
 		serverErr = server.Run(ctx)
 	}()
 
@@ -37,19 +37,32 @@ func main() {
 	var client *Connection
 	go func() {
 		defer func() { done <- struct{}{} }()
-		client, clientErr = NewConnection(clientTransport, true) // isClient = true
+		client, clientErr = NewConnection(clientTransport, true)
 		if clientErr != nil {
 			return
 		}
 		clientErr = client.Run(ctx)
 	}()
 
-	// Wait a moment for connections to establish their run loops
 	time.Sleep(100 * time.Millisecond)
 
 	// --- Run the test ---
 	go func() {
-		// 1. Client opens a stream
+		// 1. Client sends a PING in an Initial packet to start the handshake.
+		log.Println("[APP] Client sending PING to initiate handshake...")
+		client.sendQueue <- &wire.PingFrame{}
+
+		// 2. Client waits for the handshake to complete (i.e., for an ACK from the server).
+		log.Println("[APP] Client waiting for handshake...")
+		select {
+		case <-client.handshakeCompleteChan:
+			log.Println("[APP] Client handshake complete.")
+		case <-ctx.Done():
+			log.Printf("Context cancelled while waiting for handshake")
+			return
+		}
+
+		// 3. Now that the handshake is "complete", open a stream and write data.
 		log.Println("[APP] Client opening stream...")
 		stream, err := client.OpenStream(ctx)
 		if err != nil {
@@ -58,7 +71,6 @@ func main() {
 		}
 		log.Printf("[APP] Client opened stream %d", stream.StreamID())
 
-		// 2. Client writes data to the stream
 		message := "Hello from the client! This is a test of the custom QUIC-like stack."
 		log.Printf("[APP] Client writing: \"%s\"", message)
 		_, err = stream.Write([]byte(message))
@@ -66,11 +78,10 @@ func main() {
 			log.Printf("Client failed to write to stream: %v", err)
 			return
 		}
-		// Closing the write-side of the stream sends a FIN
 		stream.Close()
 		log.Println("[APP] Client closed stream writer.")
 
-		// 3. Server accepts the stream and reads the data
+		// 4. Server accepts the stream and reads the data.
 		log.Println("[APP] Server accepting stream...")
 		serverStream, err := server.AcceptStream(ctx)
 		if err != nil {
@@ -86,7 +97,7 @@ func main() {
 			return
 		}
 
-		// 4. Verify the result
+		// 5. Verify the result.
 		log.Printf("[APP] Server received: \"%s\"", string(buffer))
 		if string(buffer) == message {
 			log.Println("[SUCCESS] Data integrity confirmed.")
@@ -96,7 +107,6 @@ func main() {
 		cancel() // End the simulation
 	}()
 
-	// Wait for completion
 	<-done
 	<-done
 
