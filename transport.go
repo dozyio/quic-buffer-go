@@ -75,4 +75,4 @@ func (t *inMemoryTransport) Close() error {
 		close(t.closed)
 	})
 	return nil
-
+}
