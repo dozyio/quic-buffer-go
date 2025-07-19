@@ -199,7 +199,7 @@ func (c *Connection) receiveLoop(ctx context.Context) error {
 		frameParser := wire.NewFrameParser(true, true)
 		frameData := payload
 		for len(frameData) > 0 {
-			l, frame, err := frameParser.ParseNext(frameData, protocol.Encryption1RTT, protocol.Version1)
+			bytesRead, frame, err := frameParser.ParseNext(frameData, protocol.Encryption1RTT, protocol.Version1)
 			if err != nil {
 				log.Printf("[RECV] Failed to parse frame: %v", err)
 				break
@@ -208,7 +208,7 @@ func (c *Connection) receiveLoop(ctx context.Context) error {
 				break
 			}
 			c.handleFrame(frame)
-			frameData = frameData[l:]
+			frameData = frameData[bytesRead:]
 		}
 	}
 }
@@ -349,7 +349,7 @@ func (c *Connection) newStream(id protocol.StreamID) *Stream {
 		id,
 		c.connFlowController,
 		protocol.DefaultInitialMaxStreamData,
-		protocol.DefaultMaxReceiveStreamFlowControlWindow,
+		protocol.DefaultMaxReceiveConnectionFlowControlWindow,
 		protocol.ByteCount(protocol.DefaultInitialMaxStreamData),
 		c.rttStats,
 		c.logger,

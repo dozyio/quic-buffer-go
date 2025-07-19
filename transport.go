@@ -19,26 +19,41 @@ type LowerLayerTransport interface {
 type inMemoryTransport struct {
 	readChan  <-chan []byte
 	writeChan chan<- []byte
+	closer    *inMemoryCloser
+}
+
+// A single closer for a pair of transports
+type inMemoryCloser struct {
 	closeOnce sync.Once
 	closed    chan struct{}
+}
+
+func newInMemoryCloser() *inMemoryCloser {
+	return &inMemoryCloser{closed: make(chan struct{})}
+}
+
+func (c *inMemoryCloser) Close() {
+	c.closeOnce.Do(func() {
+		close(c.closed)
+	})
 }
 
 // newInMemoryTransportPair creates a pair of connected in-memory transports.
 func newInMemoryTransportPair() (LowerLayerTransport, LowerLayerTransport) {
 	ch1 := make(chan []byte, 100) // Buffered channels
 	ch2 := make(chan []byte, 100)
-	closed := make(chan struct{})
+	closer := newInMemoryCloser()
 
 	client := &inMemoryTransport{
 		readChan:  ch2,
 		writeChan: ch1,
-		closed:    closed,
+		closer:    closer,
 	}
 
 	server := &inMemoryTransport{
 		readChan:  ch1,
 		writeChan: ch2,
-		closed:    closed,
+		closer:    closer,
 	}
 
 	return client, server
@@ -46,7 +61,7 @@ func newInMemoryTransportPair() (LowerLayerTransport, LowerLayerTransport) {
 
 func (t *inMemoryTransport) WritePacket(pkt []byte) error {
 	select {
-	case <-t.closed:
+	case <-t.closer.closed:
 		return errors.New("transport closed")
 	default:
 	}
@@ -54,7 +69,7 @@ func (t *inMemoryTransport) WritePacket(pkt []byte) error {
 	pktCopy := make([]byte, len(pkt))
 	copy(pktCopy, pkt)
 	select {
-	case <-t.closed:
+	case <-t.closer.closed:
 		return errors.New("transport closed")
 	case t.writeChan <- pktCopy:
 		return nil
@@ -63,7 +78,7 @@ func (t *inMemoryTransport) WritePacket(pkt []byte) error {
 
 func (t *inMemoryTransport) ReadPacket() ([]byte, error) {
 	select {
-	case <-t.closed:
+	case <-t.closer.closed:
 		return nil, errors.New("transport closed")
 	case pkt := <-t.readChan:
 		return pkt, nil
@@ -71,8 +86,6 @@ func (t *inMemoryTransport) ReadPacket() ([]byte, error) {
 }
 
 func (t *inMemoryTransport) Close() error {
-	t.closeOnce.Do(func() {
-		close(t.closed)
-	})
+	t.closer.Close()
 	return nil
 }
