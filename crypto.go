@@ -1,6 +1,8 @@
 package main
 
 import (
+	"time"
+
 	"github.com/dozyio/quic-buffer-go/handshake"
 	"github.com/dozyio/quic-buffer-go/protocol"
 )
@@ -11,8 +13,10 @@ import (
 type nullAEAD struct{}
 
 var (
-	_ handshake.Sealer = &nullAEAD{}
-	_ handshake.Opener = &nullAEAD{}
+	_ handshake.ShortHeaderSealer = &nullAEAD{}
+	_ handshake.ShortHeaderOpener = &nullAEAD{}
+	_ handshake.LongHeaderSealer  = &nullAEAD{}
+	_ handshake.LongHeaderOpener  = &nullAEAD{}
 )
 
 // Seal does nothing but append the plaintext to the destination and return it.
@@ -20,9 +24,14 @@ func (n *nullAEAD) Seal(dst, plaintext []byte, pn protocol.PacketNumber, ad []by
 	return append(dst, plaintext...)
 }
 
-// Open does nothing but append the ciphertext to the destination and return it.
+// Open for LongHeaderOpener
 func (n *nullAEAD) Open(dst, ciphertext []byte, pn protocol.PacketNumber, ad []byte) ([]byte, error) {
 	return append(dst, ciphertext...), nil
+}
+
+// Open for ShortHeaderOpener
+func (n *nullAEAD) open(dst, src []byte, rcvTime time.Time, pn protocol.PacketNumber, kp protocol.KeyPhaseBit, ad []byte) ([]byte, error) {
+	return n.Open(dst, src, pn, ad)
 }
 
 // Overhead returns 0 because we add no authentication tags or other overhead.
@@ -32,4 +41,13 @@ func (n *nullAEAD) Overhead() int {
 
 func (n *nullAEAD) KeyPhase() protocol.KeyPhaseBit {
 	return protocol.KeyPhaseZero
+}
+
+func (n *nullAEAD) EncryptHeader(sample []byte, firstByte *byte, pnBytes []byte) {}
+func (n *nullAEAD) DecryptHeader(sample []byte, firstByte *byte, pnBytes []byte) {}
+
+func (n *nullAEAD) DecodePacketNumber(wirePN protocol.PacketNumber, wirePNLen protocol.PacketNumberLen) protocol.PacketNumber {
+	// This is a simplified implementation for the dummy AEAD.
+	// A real implementation would use the largest acknowledged packet number.
+	return wirePN
 }

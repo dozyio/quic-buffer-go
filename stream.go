@@ -107,7 +107,7 @@ func (s *Stream) handleStreamFrame(frame *wire.StreamFrame) {
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
 
-	if frame.Len() > 0 {
+	if frame.DataLen() > 0 {
 		// A real implementation would check flow control limits here.
 		s.readBuffer.Write(frame.Data)
 	}

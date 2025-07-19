@@ -27,6 +27,9 @@ func (l *dummyLogger) Debugf(format string, args ...interface{}) {}
 func (l *dummyLogger) Infof(format string, args ...interface{})  {}
 func (l *dummyLogger) Errorf(format string, args ...interface{}) {}
 func (l *dummyLogger) WithPrefix(prefix string) utils.Logger     { return l }
+func (l *dummyLogger) Debug() bool                               { return false }
+func (l *dummyLogger) SetLogLevel(level utils.LogLevel)          {}
+func (l *dummyLogger) SetLogTimeFormat(format string)            {}
 
 // Connection is the central object that manages the entire QUIC-like session.
 type Connection struct {
@@ -46,13 +49,13 @@ type Connection struct {
 	// quic-go components
 	sentPacketHandler     ackhandler.SentPacketHandler
 	receivedPacketHandler ackhandler.ReceivedPacketHandler
-	congestionController  congestion.CongestionController
+	congestionController  congestion.SendAlgorithmWithDebugInfos
 	connFlowController    flowcontrol.ConnectionFlowController
-	rttStats              *congestion.RTTStats
+	rttStats              *utils.RTTStats
 
 	// Dummy crypto
-	sealer handshake.Sealer
-	opener handshake.Opener
+	sealer handshake.ShortHeaderSealer
+	opener handshake.ShortHeaderOpener
 
 	// Data to send
 	sendQueue chan wire.Frame
@@ -64,6 +67,12 @@ type Connection struct {
 func NewConnection(transport LowerLayerTransport, isClient bool) (*Connection, error) {
 	connID, _ := protocol.GenerateConnectionID(8)
 	logger := &dummyLogger{}
+	rttStats := &utils.RTTStats{}
+
+	perspective := protocol.PerspectiveClient
+	if !isClient {
+		perspective = protocol.PerspectiveServer
+	}
 
 	c := &Connection{
 		transport:   transport,
@@ -71,7 +80,7 @@ func NewConnection(transport LowerLayerTransport, isClient bool) (*Connection, e
 		destConnID:  connID,
 		streams:     make(map[protocol.StreamID]*Stream),
 		acceptQueue: make(chan *Stream, 10),
-		rttStats:    congestion.NewRTTStats(),
+		rttStats:    rttStats,
 		sealer:      &nullAEAD{},
 		opener:      &nullAEAD{},
 		sendQueue:   make(chan wire.Frame, 100),
@@ -83,15 +92,15 @@ func NewConnection(transport LowerLayerTransport, isClient bool) (*Connection, e
 	c.congestionController = congestion.NewCubicSender(
 		congestion.DefaultClock{},
 		c.rttStats,
-		protocol.InitialCongestionWindow, // Initial window
-		true,                             // Use Reno
-		c.logger,
+		protocol.InitialPacketSize,
+		true, // Use Reno
+		nil,
 	)
 
 	c.connFlowController = flowcontrol.NewConnectionFlowController(
-		protocol.InitialMaxData,
-		protocol.InitialMaxData,
-		func(protocol.ByteCount) {}, // No-op window update function
+		protocol.DefaultInitialMaxData,
+		protocol.DefaultMaxReceiveConnectionFlowControlWindow,
+		func(protocol.ByteCount) bool { return true }, // No-op window update function
 		c.rttStats,
 		c.logger,
 	)
@@ -102,16 +111,18 @@ func NewConnection(transport LowerLayerTransport, isClient bool) (*Connection, e
 		c.nextStreamID = 1
 	}
 
-	c.sentPacketHandler = ackhandler.NewSentPacketHandler(
+	sentPacketHandler, receivedPacketHandler := ackhandler.NewAckHandler(
+		0,
+		protocol.InitialPacketSize,
 		c.rttStats,
-		c.congestionController,
+		!isClient,
+		false,
+		perspective,
+		nil,
 		c.logger,
 	)
-
-	c.receivedPacketHandler = ackhandler.NewReceivedPacketHandler(
-		c.rttStats,
-		c.logger,
-	)
+	c.sentPacketHandler = sentPacketHandler
+	c.receivedPacketHandler = receivedPacketHandler
 
 	return c, nil
 }
@@ -169,34 +180,35 @@ func (c *Connection) receiveLoop(ctx context.Context) error {
 			continue
 		}
 
-		hdr.PacketNumber, hdr.PacketNumberLen, err = wire.DecodePacketNumber(
-			hdr.PacketNumberLen,
-			c.nextPacketNumber,
-			hdr.Raw[len(hdr.Raw)-int(hdr.PacketNumberLen):],
-		)
+		extHdr, err := hdr.ParseExtended(data)
 		if err != nil {
-			log.Printf("[RECV] Failed to decode packet number: %v", err)
+			log.Printf("[RECV] Failed to parse extended header: %v", err)
 			continue
 		}
 
-		payload, err := c.opener.Open(nil, packetData, hdr.PacketNumber, hdr.Raw)
+		payload, err := c.opener.Open(nil, packetData[extHdr.ParsedLen():], time.Now(), extHdr.PacketNumber, extHdr.KeyPhase, packetData[:extHdr.ParsedLen()])
 		if err != nil {
 			log.Printf("[RECV] Failed to 'decrypt' packet: %v", err)
 			continue
 		}
 
 		// Let the ackhandler know we received this packet.
-		c.receivedPacketHandler.ReceivedPacket(hdr.PacketNumber, protocol.ECNUnsupported, protocol.Encryption1RTT, time.Now(), true)
+		c.receivedPacketHandler.ReceivedPacket(extHdr.PacketNumber, protocol.ECNUnsupported, protocol.Encryption1RTT, time.Now(), true)
 
 		// Parse frames.
-		r := bytes.NewReader(payload)
-		for r.Len() > 0 {
-			frame, err := wire.ParseNextFrame(r, hdr.Type, protocol.Version1)
+		frameParser := wire.NewFrameParser(true, true)
+		frameData := payload
+		for len(frameData) > 0 {
+			l, frame, err := frameParser.ParseNext(frameData, protocol.Encryption1RTT, protocol.Version1)
 			if err != nil {
 				log.Printf("[RECV] Failed to parse frame: %v", err)
 				break
 			}
+			if frame == nil {
+				break
+			}
 			c.handleFrame(frame)
+			frameData = frameData[l:]
 		}
 	}
 }
@@ -205,7 +217,7 @@ func (c *Connection) receiveLoop(ctx context.Context) error {
 func (c *Connection) handleFrame(frame wire.Frame) {
 	switch f := frame.(type) {
 	case *wire.StreamFrame:
-		log.Printf("[RECV] Got STREAM frame for stream %d, len %d, fin: %t", f.StreamID, f.Len(), f.Fin)
+		log.Printf("[RECV] Got STREAM frame for stream %d, len %d, fin: %t", f.StreamID, f.DataLen(), f.Fin)
 		c.streamsMu.RLock()
 		stream, ok := c.streams[f.StreamID]
 		c.streamsMu.RUnlock()
@@ -221,7 +233,7 @@ func (c *Connection) handleFrame(frame wire.Frame) {
 
 	case *wire.AckFrame:
 		log.Printf("[RECV] Got ACK frame.")
-		err := c.sentPacketHandler.ReceivedAck(f, protocol.Encryption1RTT, time.Now())
+		_, err := c.sentPacketHandler.ReceivedAck(f, protocol.Encryption1RTT, time.Now())
 		if err != nil {
 			log.Printf("Error processing ACK frame: %v", err)
 		}
@@ -244,7 +256,7 @@ func (c *Connection) sendLoop(ctx context.Context) error {
 		case frame := <-c.sendQueue:
 			frames = append(frames, frame)
 		case <-ticker.C:
-			if ack := c.receivedPacketHandler.GetAckFrame(protocol.Encryption1RTT, time.Now()); ack != nil {
+			if ack := c.receivedPacketHandler.GetAckFrame(protocol.Encryption1RTT, time.Now(), false); ack != nil {
 				frames = append(frames, ack)
 			}
 
@@ -262,22 +274,21 @@ func (c *Connection) sendLoop(ctx context.Context) error {
 
 // sendPacket constructs and sends a single packet containing the given frames.
 func (c *Connection) sendPacket(frames []wire.Frame) error {
-	pn := c.nextPacketNumber
-	c.nextPacketNumber++
-
-	hdr := &wire.Header{
-		Type:             protocol.PacketType1RTT,
-		DestConnectionID: c.destConnID,
-		PacketNumberLen:  protocol.PacketNumberLen4,
-	}
+	pn, pnLen := c.sentPacketHandler.PeekPacketNumber(protocol.Encryption1RTT)
+	c.sentPacketHandler.PopPacketNumber(protocol.Encryption1RTT)
 
 	payloadBuf := getPacketBuffer()
 	defer putPacketBuffer(payloadBuf)
 
+	var ackhandlerFrames []ackhandler.Frame
 	for _, frame := range frames {
-		if err := frame.Write(payloadBuf, protocol.Version1); err != nil {
+		b, err := frame.Append(payloadBuf.Bytes(), protocol.Version1)
+		if err != nil {
 			return err
 		}
+		payloadBuf.Reset()
+		payloadBuf.Write(b)
+		ackhandlerFrames = append(ackhandlerFrames, ackhandler.Frame{Frame: frame})
 	}
 
 	// Let the ackhandler know what we're sending.
@@ -286,22 +297,23 @@ func (c *Connection) sendPacket(frames []wire.Frame) error {
 		pn,
 		protocol.InvalidPacketNumber,
 		nil,
-		nil,
+		ackhandlerFrames,
 		protocol.Encryption1RTT,
 		protocol.ECNUnsupported,
 		protocol.ByteCount(payloadBuf.Len()),
-		true,
-		false,
+		false, // isPathMTUProbePacket
+		false, // isPathProbePacket
 	)
 
 	// "Encrypt" the payload
 	encryptedPayload := c.sealer.Seal(nil, payloadBuf.Bytes(), pn, nil)
 
 	// Compose the packet
-	raw, err := wire.AppendShortHeader(nil, hdr, encryptedPayload)
+	raw, err := wire.AppendShortHeader(nil, c.destConnID, pn, pnLen, c.sealer.KeyPhase())
 	if err != nil {
 		return err
 	}
+	raw = append(raw, encryptedPayload...)
 
 	log.Printf("[SEND] Sending packet %d with %d frames.", pn, len(frames))
 	return c.transport.WritePacket(raw)
@@ -336,9 +348,9 @@ func (c *Connection) newStream(id protocol.StreamID) *Stream {
 	fc := flowcontrol.NewStreamFlowController(
 		id,
 		c.connFlowController,
-		protocol.InitialMaxStreamDataBidiLocal,
-		protocol.InitialMaxStreamDataBidiLocal,
-		protocol.ByteCount(protocol.InitialMaxStreamDataBidiLocal),
+		protocol.DefaultInitialMaxStreamData,
+		protocol.DefaultMaxReceiveStreamFlowControlWindow,
+		protocol.ByteCount(protocol.DefaultInitialMaxStreamData),
 		c.rttStats,
 		c.logger,
 	)
@@ -352,12 +364,12 @@ func (c *Connection) newStream(id protocol.StreamID) *Stream {
 func (c *Connection) sendStreamData(id protocol.StreamID, data []byte, fin bool) {
 	// A real implementation would manage stream offsets and chunk data.
 	frame := &wire.StreamFrame{
-		StreamID: id,
-		Offset:   0,
-		Data:     data,
-		Fin:      fin,
+		StreamID:       id,
+		Offset:         0,
+		Data:           data,
+		Fin:            fin,
+		DataLenPresent: true,
 	}
-	frame.SetLen(uint64(len(data)))
 	c.sendQueue <- frame
 }
 
