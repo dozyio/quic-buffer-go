@@ -31,6 +31,19 @@ func (l *dummyLogger) Debug() bool                               { return false 
 func (l *dummyLogger) SetLogLevel(level utils.LogLevel)          {}
 func (l *dummyLogger) SetLogTimeFormat(format string)            {}
 
+func packetTypeToEncryptionLevel(t protocol.PacketType) protocol.EncryptionLevel {
+	switch t {
+	case protocol.PacketTypeInitial:
+		return protocol.EncryptionInitial
+	case protocol.PacketTypeHandshake:
+		return protocol.EncryptionHandshake
+	case protocol.PacketType0RTT:
+		return protocol.Encryption0RTT
+	default:
+		return protocol.EncryptionLevel(255) // Invalid
+	}
+}
+
 // Connection is the central object that manages the entire QUIC-like session.
 type Connection struct {
 	transport LowerLayerTransport
@@ -54,8 +67,10 @@ type Connection struct {
 	rttStats              *utils.RTTStats
 
 	// Dummy crypto
-	sealer handshake.ShortHeaderSealer
-	opener handshake.ShortHeaderOpener
+	longHeaderSealer  handshake.LongHeaderSealer
+	longHeaderOpener  handshake.LongHeaderOpener
+	shortHeaderSealer handshake.ShortHeaderSealer
+	shortHeaderOpener handshake.ShortHeaderOpener
 
 	// Data to send
 	sendQueue chan wire.Frame
@@ -75,17 +90,19 @@ func NewConnection(transport LowerLayerTransport, isClient bool) (*Connection, e
 	}
 
 	c := &Connection{
-		transport:   transport,
-		isClient:    isClient,
-		destConnID:  connID,
-		streams:     make(map[protocol.StreamID]*Stream),
-		acceptQueue: make(chan *Stream, 10),
-		rttStats:    rttStats,
-		sealer:      &nullAEAD{},
-		opener:      &nullAEAD{},
-		sendQueue:   make(chan wire.Frame, 100),
-		closeChan:   make(chan struct{}),
-		logger:      logger,
+		transport:         transport,
+		isClient:          isClient,
+		destConnID:        connID,
+		streams:           make(map[protocol.StreamID]*Stream),
+		acceptQueue:       make(chan *Stream, 10),
+		rttStats:          rttStats,
+		longHeaderSealer:  &nullLongHeaderAEAD{},
+		longHeaderOpener:  &nullLongHeaderAEAD{},
+		shortHeaderSealer: &nullShortHeaderAEAD{},
+		shortHeaderOpener: &nullShortHeaderAEAD{},
+		sendQueue:         make(chan wire.Frame, 100),
+		closeChan:         make(chan struct{}),
+		logger:            logger,
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 
@@ -174,6 +191,8 @@ func (c *Connection) receiveLoop(ctx context.Context) error {
 			return err
 		}
 
+		// This demo is simplified: it assumes all incoming packets are long header packets.
+		// A real implementation would distinguish between long and short headers here.
 		hdr, packetData, _, err := wire.ParsePacket(data)
 		if err != nil {
 			log.Printf("[RECV] Failed to parse packet header: %v", err)
@@ -186,20 +205,20 @@ func (c *Connection) receiveLoop(ctx context.Context) error {
 			continue
 		}
 
-		payload, err := c.opener.Open(nil, packetData[extHdr.ParsedLen():], time.Now(), extHdr.PacketNumber, extHdr.KeyPhase, packetData[:extHdr.ParsedLen()])
+		payload, err := c.longHeaderOpener.Open(nil, packetData[extHdr.ParsedLen():], extHdr.PacketNumber, packetData[:extHdr.ParsedLen()])
 		if err != nil {
 			log.Printf("[RECV] Failed to 'decrypt' packet: %v", err)
 			continue
 		}
 
-		// Let the ackhandler know we received this packet.
-		c.receivedPacketHandler.ReceivedPacket(extHdr.PacketNumber, protocol.ECNUnsupported, protocol.Encryption1RTT, time.Now(), true)
+		encLevel := packetTypeToEncryptionLevel(hdr.Type)
+		c.receivedPacketHandler.ReceivedPacket(extHdr.PacketNumber, protocol.ECNUnsupported, encLevel, time.Now(), true)
 
 		// Parse frames.
 		frameParser := wire.NewFrameParser(true, true)
 		frameData := payload
 		for len(frameData) > 0 {
-			bytesRead, frame, err := frameParser.ParseNext(frameData, protocol.Encryption1RTT, protocol.Version1)
+			bytesRead, frame, err := frameParser.ParseNext(frameData, encLevel, protocol.Version1)
 			if err != nil {
 				log.Printf("[RECV] Failed to parse frame: %v", err)
 				break
@@ -233,7 +252,7 @@ func (c *Connection) handleFrame(frame wire.Frame) {
 
 	case *wire.AckFrame:
 		log.Printf("[RECV] Got ACK frame.")
-		_, err := c.sentPacketHandler.ReceivedAck(f, protocol.Encryption1RTT, time.Now())
+		_, err := c.sentPacketHandler.ReceivedAck(f, protocol.EncryptionInitial, time.Now())
 		if err != nil {
 			log.Printf("Error processing ACK frame: %v", err)
 		}
@@ -256,7 +275,9 @@ func (c *Connection) sendLoop(ctx context.Context) error {
 		case frame := <-c.sendQueue:
 			frames = append(frames, frame)
 		case <-ticker.C:
-			if ack := c.receivedPacketHandler.GetAckFrame(protocol.Encryption1RTT, time.Now(), false); ack != nil {
+			// In a real implementation, you'd check which packet number space
+			// is writable and get the correct ACK frame.
+			if ack := c.receivedPacketHandler.GetAckFrame(protocol.EncryptionInitial, time.Now(), false); ack != nil {
 				frames = append(frames, ack)
 			}
 
@@ -274,13 +295,15 @@ func (c *Connection) sendLoop(ctx context.Context) error {
 
 // sendPacket constructs and sends a single packet containing the given frames.
 func (c *Connection) sendPacket(frames []wire.Frame) error {
-	pn, pnLen := c.sentPacketHandler.PeekPacketNumber(protocol.Encryption1RTT)
-	c.sentPacketHandler.PopPacketNumber(protocol.Encryption1RTT)
+	// For this demo, we'll send an Initial packet to start.
+	// A real implementation would manage encryption levels and packet types.
+	encLevel := protocol.EncryptionInitial
+	pn, pnLen := c.sentPacketHandler.PeekPacketNumber(encLevel)
+	c.sentPacketHandler.PopPacketNumber(encLevel)
 
 	payloadBuf := getPacketBuffer()
 	defer putPacketBuffer(payloadBuf)
 
-	var ackhandlerFrames []ackhandler.Frame
 	for _, frame := range frames {
 		b, err := frame.Append(payloadBuf.Bytes(), protocol.Version1)
 		if err != nil {
@@ -288,32 +311,45 @@ func (c *Connection) sendPacket(frames []wire.Frame) error {
 		}
 		payloadBuf.Reset()
 		payloadBuf.Write(b)
-		ackhandlerFrames = append(ackhandlerFrames, ackhandler.Frame{Frame: frame})
 	}
 
-	// Let the ackhandler know what we're sending.
+	hdr := &wire.ExtendedHeader{
+		Header: wire.Header{
+			Type:             protocol.PacketTypeInitial,
+			DestConnectionID: c.destConnID,
+			SrcConnectionID:  c.destConnID, // Should be a different ID
+			Length:           protocol.ByteCount(payloadBuf.Len() + int(pnLen) + c.longHeaderSealer.Overhead()),
+			Version:          protocol.Version1,
+		},
+		PacketNumber:    pn,
+		PacketNumberLen: pnLen,
+	}
+
+	var ackhandlerFrames []ackhandler.Frame
+	for _, f := range frames {
+		ackhandlerFrames = append(ackhandlerFrames, ackhandler.Frame{Frame: f})
+	}
+
 	c.sentPacketHandler.SentPacket(
 		time.Now(),
 		pn,
 		protocol.InvalidPacketNumber,
 		nil,
 		ackhandlerFrames,
-		protocol.Encryption1RTT,
+		encLevel,
 		protocol.ECNUnsupported,
-		protocol.ByteCount(payloadBuf.Len()),
-		false, // isPathMTUProbePacket
-		false, // isPathProbePacket
+		hdr.Length,
+		false,
+		false,
 	)
 
-	// "Encrypt" the payload
-	encryptedPayload := c.sealer.Seal(nil, payloadBuf.Bytes(), pn, nil)
-
-	// Compose the packet
-	raw, err := wire.AppendShortHeader(nil, c.destConnID, pn, pnLen, c.sealer.KeyPhase())
+	raw, err := hdr.Append(nil, protocol.Version1)
 	if err != nil {
 		return err
 	}
-	raw = append(raw, encryptedPayload...)
+
+	payload := c.longHeaderSealer.Seal(nil, payloadBuf.Bytes(), pn, raw)
+	raw = append(raw, payload...)
 
 	log.Printf("[SEND] Sending packet %d with %d frames.", pn, len(frames))
 	return c.transport.WritePacket(raw)

@@ -7,40 +7,52 @@ import (
 	"github.com/dozyio/quic-buffer-go/protocol"
 )
 
-// nullAEAD is a dummy struct that implements the Sealer and Opener interfaces
-// from quic-go's handshake package. It passes data through without any
-// encryption or authentication. This is the "dummy crypto layer".
-type nullAEAD struct{}
+// nullLongHeaderAEAD is a dummy AEAD for Initial and Handshake packets.
+type nullLongHeaderAEAD struct{}
 
 var (
-	_ handshake.ShortHeaderSealer = &nullAEAD{}
-	_ handshake.ShortHeaderOpener = &nullAEAD{}
+	_ handshake.LongHeaderSealer = &nullLongHeaderAEAD{}
+	_ handshake.LongHeaderOpener = &nullLongHeaderAEAD{}
 )
 
-// Seal does nothing but append the plaintext to the destination and return it.
-func (n *nullAEAD) Seal(dst, plaintext []byte, pn protocol.PacketNumber, ad []byte) []byte {
+func (n *nullLongHeaderAEAD) Seal(dst, plaintext []byte, pn protocol.PacketNumber, ad []byte) []byte {
 	return append(dst, plaintext...)
 }
 
-// Open for ShortHeaderOpener
-func (n *nullAEAD) Open(dst, src []byte, rcvTime time.Time, pn protocol.PacketNumber, kp protocol.KeyPhaseBit, ad []byte) ([]byte, error) {
-	return append(dst, src...), nil
+func (n *nullLongHeaderAEAD) Open(dst, ciphertext []byte, pn protocol.PacketNumber, ad []byte) ([]byte, error) {
+	return append(dst, ciphertext...), nil
 }
 
-// Overhead returns 0 because we add no authentication tags or other overhead.
-func (n *nullAEAD) Overhead() int {
-	return 0
+func (n *nullLongHeaderAEAD) Overhead() int { return 0 }
+
+func (n *nullLongHeaderAEAD) EncryptHeader(sample []byte, firstByte *byte, pnBytes []byte) {}
+func (n *nullLongHeaderAEAD) DecryptHeader(sample []byte, firstByte *byte, pnBytes []byte) {}
+func (n *nullLongHeaderAEAD) DecodePacketNumber(wirePN protocol.PacketNumber, wirePNLen protocol.PacketNumberLen) protocol.PacketNumber {
+	return wirePN
 }
 
-func (n *nullAEAD) KeyPhase() protocol.KeyPhaseBit {
-	return protocol.KeyPhaseZero
+// nullShortHeaderAEAD is a dummy AEAD for 1-RTT packets.
+type nullShortHeaderAEAD struct{}
+
+var (
+	_ handshake.ShortHeaderSealer = &nullShortHeaderAEAD{}
+	_ handshake.ShortHeaderOpener = &nullShortHeaderAEAD{}
+)
+
+func (n *nullShortHeaderAEAD) Seal(dst, plaintext []byte, pn protocol.PacketNumber, ad []byte) []byte {
+	return append(dst, plaintext...)
 }
 
-func (n *nullAEAD) EncryptHeader(sample []byte, firstByte *byte, pnBytes []byte) {}
-func (n *nullAEAD) DecryptHeader(sample []byte, firstByte *byte, pnBytes []byte) {}
+func (n *nullShortHeaderAEAD) Open(dst, ciphertext []byte, rcvTime time.Time, pn protocol.PacketNumber, kp protocol.KeyPhaseBit, ad []byte) ([]byte, error) {
+	return append(dst, ciphertext...), nil
+}
 
-func (n *nullAEAD) DecodePacketNumber(wirePN protocol.PacketNumber, wirePNLen protocol.PacketNumberLen) protocol.PacketNumber {
-	// This is a simplified implementation for the dummy AEAD.
-	// A real implementation would use the largest acknowledged packet number.
+func (n *nullShortHeaderAEAD) Overhead() int { return 0 }
+
+func (n *nullShortHeaderAEAD) KeyPhase() protocol.KeyPhaseBit { return protocol.KeyPhaseZero }
+
+func (n *nullShortHeaderAEAD) EncryptHeader(sample []byte, firstByte *byte, pnBytes []byte) {}
+func (n *nullShortHeaderAEAD) DecryptHeader(sample []byte, firstByte *byte, pnBytes []byte) {}
+func (n *nullShortHeaderAEAD) DecodePacketNumber(wirePN protocol.PacketNumber, wirePNLen protocol.PacketNumberLen) protocol.PacketNumber {
 	return wirePN
 }
