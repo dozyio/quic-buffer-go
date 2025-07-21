@@ -60,18 +60,24 @@ func (s *Stream) Read(p []byte) (n int, err error) {
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
 
-	for {
-		if s.readBuffer.Len() > 0 {
-			return s.readBuffer.Read(p)
-		}
-		if s.readErr != nil {
-			return 0, s.readErr
-		}
-		if s.isFinished {
-			return 0, io.EOF
-		}
+	// Wait until the buffer has data, the stream is finished, or an error has occurred.
+	for s.readBuffer.Len() == 0 && !s.isFinished && s.readErr == nil {
 		s.readCond.Wait()
 	}
+
+	// If there's data in the buffer, read it and return.
+	// This takes priority over EOF or errors.
+	if s.readBuffer.Len() > 0 {
+		return s.readBuffer.Read(p)
+	}
+
+	// If the stream is finished (and the buffer is empty), return EOF.
+	if s.isFinished {
+		return 0, io.EOF
+	}
+
+	// Otherwise, return the error that woke us up.
+	return 0, s.readErr
 }
 
 // Write writes data to the stream. It may block if flow control prevents sending.
@@ -83,7 +89,7 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 		return 0, s.writeErr
 	}
 
-	const maxDataSize = 1100 // A conservative chunk size to leave room for packet headers.
+	const maxDataSize = 1300 // A conservative chunk size to leave room for packet headers.
 
 	var totalSent int
 	for len(p) > 0 {

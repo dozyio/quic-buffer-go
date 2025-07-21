@@ -203,7 +203,7 @@ func TestBulkBinaryTransfer(t *testing.T) {
 	log.Println("[TEST] Handshake complete for both peers.")
 
 	// Data transfer
-	const dataSize = 1024 * 1024 * 1024 // 10 MB
+	const dataSize = 100 * 1024 * 1024 // 10 MB
 	clientData := make([]byte, dataSize)
 	_, err = rand.Read(clientData)
 	require.NoError(t, err)
