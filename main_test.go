@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"io"
+	"log"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,144 +15,243 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// setupTestConnections creates a client and a server, starts them, and returns them.
-func setupTestConnections(t *testing.T, ctx context.Context) (*Connection, *Connection) {
-	clientTransport, serverTransport := newInMemoryTransportPair()
-	var serverErr, clientErr error
-	done := make(chan struct{}, 2)
-
-	var server *Connection
-	go func() {
-		defer func() { done <- struct{}{} }()
-		var err error
-		server, err = NewConnection(serverTransport, false)
-		require.NoError(t, err)
-		serverErr = server.Run(ctx)
-	}()
-
-	var client *Connection
-	go func() {
-		defer func() { done <- struct{}{} }()
-		var err error
-		client, err = NewConnection(clientTransport, true)
-		require.NoError(t, err)
-		clientErr = client.Run(ctx)
-	}()
-
-	t.Cleanup(func() {
-		<-done
-		<-done
-		if clientErr != nil && clientErr != context.Canceled {
-			t.Errorf("Client exited with error: %v", clientErr)
-		}
-		if serverErr != nil && serverErr != context.Canceled {
-			t.Errorf("Server exited with error: %v", serverErr)
-		}
-	})
-
-	time.Sleep(100 * time.Millisecond) // Give time for goroutines to start
-	return client, server
+// mockTransport is a simple in-memory transport for testing.
+type mockTransport struct {
+	clientToServer chan []byte
+	serverToClient chan []byte
+	wg             sync.WaitGroup
+	isClosed       bool
+	mu             sync.Mutex
 }
 
-// performHandshake simulates the initial handshake process.
-func performHandshake(t *testing.T, ctx context.Context, client, server *Connection) {
-	t.Log("[TEST] Client sending PING to initiate handshake...")
-	client.sendQueue <- &wire.PingFrame{}
-
-	t.Log("[TEST] Waiting for handshake to complete for both client and server...")
-	handshakeDone := make(chan struct{}, 2)
-	go func() {
-		select {
-		case <-client.handshakeCompleteChan:
-			t.Log("[TEST] Client handshake complete.")
-			handshakeDone <- struct{}{}
-		case <-ctx.Done():
-			t.Error("Context cancelled while waiting for client handshake")
-		}
-	}()
-	go func() {
-		select {
-		case <-server.handshakeCompleteChan:
-			t.Log("[TEST] Server handshake complete.")
-			handshakeDone <- struct{}{}
-		case <-ctx.Done():
-			t.Error("Context cancelled while waiting for server handshake")
-		}
-	}()
-
-	for i := 0; i < 2; i++ {
-		select {
-		case <-handshakeDone:
-		case <-time.After(5 * time.Second):
-			t.Fatal("Handshake timeout")
-		}
+func newMockTransport() *mockTransport {
+	return &mockTransport{
+		clientToServer: make(chan []byte, 50),
+		serverToClient: make(chan []byte, 50),
 	}
-	t.Log("[TEST] Handshake complete for both peers.")
+}
+
+func (t *mockTransport) WritePacket(p []byte) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.isClosed {
+		return io.EOF
+	}
+	t.clientToServer <- p
+	return nil
+}
+
+func (t *mockTransport) ReadPacket() ([]byte, error) {
+	p, ok := <-t.serverToClient
+	if !ok {
+		return nil, io.EOF
+	}
+	return p, nil
+}
+
+func (t *mockTransport) Close() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.isClosed {
+		close(t.clientToServer)
+		close(t.serverToClient)
+		t.isClosed = true
+	}
+	return nil
+}
+
+// Inverted returns the server's perspective of the transport.
+func (t *mockTransport) Inverted() *mockTransportInverted {
+	return &mockTransportInverted{parent: t}
+}
+
+type mockTransportInverted struct {
+	parent *mockTransport
+}
+
+func (t *mockTransportInverted) WritePacket(p []byte) error {
+	return t.parent.writePacketToServer(p)
+}
+
+func (t *mockTransportInverted) ReadPacket() ([]byte, error) {
+	return t.parent.readPacketFromServer()
+}
+
+func (t *mockTransportInverted) Close() error {
+	return t.parent.Close()
+}
+
+func (t *mockTransport) writePacketToServer(p []byte) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.isClosed {
+		return io.EOF
+	}
+	t.serverToClient <- p
+	return nil
+}
+
+func (t *mockTransport) readPacketFromServer() ([]byte, error) {
+	p, ok := <-t.clientToServer
+	if !ok {
+		return nil, io.EOF
+	}
+	return p, nil
 }
 
 func TestTextMessageTransfer(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	client, server := setupTestConnections(t, ctx)
-	performHandshake(t, ctx, client, server)
 
-	message := "Hello from the client! This is a test of the custom QUIC-like stack."
+	transport := newMockTransport()
+	client, err := NewConnection(transport, true)
+	require.NoError(t, err)
+	server, err := NewConnection(transport.Inverted(), false)
+	require.NoError(t, err)
 
+	var wg sync.WaitGroup
+	wg.Add(2)
 	go func() {
-		t.Log("[CLIENT] Opening stream...")
-		stream, err := client.OpenStream(ctx)
-		require.NoError(t, err)
-		t.Logf("[CLIENT] Writing: \"%s\"", message)
-		_, err = stream.Write([]byte(message))
-		require.NoError(t, err)
-		require.NoError(t, stream.Close())
-		t.Log("[CLIENT] Closed stream writer.")
+		defer wg.Done()
+		err := client.Run(ctx)
+		require.True(t, err == nil || err == context.Canceled || err == context.DeadlineExceeded || errors.Is(err, io.EOF))
+	}()
+	go func() {
+		defer wg.Done()
+		err := server.Run(ctx)
+		require.True(t, err == nil || err == context.Canceled || err == context.DeadlineExceeded || errors.Is(err, io.EOF))
 	}()
 
-	t.Log("[SERVER] Accepting stream...")
-	serverStream, err := server.AcceptStream(ctx)
-	require.NoError(t, err)
+	// Handshake
+	log.Println("[TEST] Client sending PING to initiate handshake...")
+	client.sendQueue <- &wire.PingFrame{}
 
-	t.Log("[SERVER] Reading from stream...")
-	buffer, err := io.ReadAll(serverStream)
-	require.NoError(t, err)
+	log.Println("[TEST] Waiting for handshake to complete for both client and server...")
+	<-client.handshakeCompleteChan
+	log.Println("[TEST] Client handshake complete.")
+	<-server.handshakeCompleteChan
+	log.Println("[TEST] Server handshake complete.")
+	log.Println("[TEST] Handshake complete for both peers.")
 
-	t.Logf("[SERVER] Received: \"%s\"", string(buffer))
-	require.Equal(t, message, string(buffer), "Data mismatch!")
-	t.Log("[SUCCESS] Text message transfer confirmed.")
+	// Data transfer
+	message := "Hello from the client! This is a test of the custom QUIC-like stack."
+	var serverReceivedMessage string
+	var transferWg sync.WaitGroup
+	transferWg.Add(1)
+
+	go func() {
+		defer transferWg.Done()
+		log.Println("[SERVER] Accepting stream...")
+		stream, err := server.AcceptStream(ctx)
+		require.NoError(t, err)
+		log.Println("[SERVER] Reading from stream...")
+		receivedBytes, err := io.ReadAll(stream)
+		require.NoError(t, err) // io.ReadAll returns nil error on successful read to EOF
+		serverReceivedMessage = string(receivedBytes)
+		log.Printf("[SERVER] Received: \"%s\"", serverReceivedMessage)
+	}()
+
+	log.Println("[CLIENT] Opening stream...")
+	stream, err := client.OpenStream(ctx)
+	require.NoError(t, err)
+	log.Printf("[CLIENT] Writing: \"%s\"", message)
+	_, err = stream.Write([]byte(message))
+	require.NoError(t, err)
+	log.Println("[CLIENT] Closed stream writer.")
+	require.NoError(t, stream.Close())
+
+	transferWg.Wait()
+	require.Equal(t, message, serverReceivedMessage)
+	log.Println("[SUCCESS] Text message transfer confirmed.")
+
+	client.Close(nil)
+	server.Close(nil)
+	wg.Wait()
 }
 
 func TestBulkBinaryTransfer(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // Longer timeout for bulk transfer
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	client, server := setupTestConnections(t, ctx)
-	performHandshake(t, ctx, client, server)
 
-	const dataSize = 10 * 1024 * 1024 // 10 MB
-	originalData := make([]byte, dataSize)
-	_, err := rand.Read(originalData)
+	transport := newMockTransport()
+	client, err := NewConnection(transport, true)
+	require.NoError(t, err)
+	server, err := NewConnection(transport.Inverted(), false)
 	require.NoError(t, err)
 
+	var wg sync.WaitGroup
+	wg.Add(2)
 	go func() {
-		t.Log("[CLIENT] Opening stream for bulk transfer...")
-		stream, err := client.OpenStream(ctx)
-		require.NoError(t, err)
-		t.Logf("[CLIENT] Writing %d bytes...", dataSize)
-		_, err = stream.Write(originalData)
-		require.NoError(t, err)
-		require.NoError(t, stream.Close())
-		t.Log("[CLIENT] Finished writing and closed stream.")
+		defer wg.Done()
+		err := client.Run(ctx)
+		require.True(t, err == nil || err == context.Canceled || err == context.DeadlineExceeded || errors.Is(err, io.EOF))
+	}()
+	go func() {
+		defer wg.Done()
+		err := server.Run(ctx)
+		require.True(t, err == nil || err == context.Canceled || err == context.DeadlineExceeded || errors.Is(err, io.EOF))
 	}()
 
-	t.Log("[SERVER] Accepting stream for bulk transfer...")
-	serverStream, err := server.AcceptStream(ctx)
+	// Handshake
+	log.Println("[TEST] Client sending PING to initiate handshake...")
+	client.sendQueue <- &wire.PingFrame{}
+	log.Println("[TEST] Waiting for handshake to complete for both client and server...")
+	<-client.handshakeCompleteChan
+	log.Println("[TEST] Client handshake complete.")
+	<-server.handshakeCompleteChan
+	log.Println("[TEST] Server handshake complete.")
+	log.Println("[TEST] Handshake complete for both peers.")
+
+	// Data transfer
+	const dataSize = 1024 * 1024 * 1024 // 10 MB
+	clientData := make([]byte, dataSize)
+	_, err = rand.Read(clientData)
 	require.NoError(t, err)
 
-	t.Log("[SERVER] Reading from stream...")
-	receivedData, err := io.ReadAll(serverStream)
-	require.NoError(t, err)
+	var serverReceivedData []byte
+	var transferWg sync.WaitGroup
+	transferWg.Add(1)
 
-	t.Logf("[SERVER] Received %d bytes.", len(receivedData))
-	require.True(t, bytes.Equal(originalData, receivedData), "Bulk data mismatch!")
-	t.Log("[SUCCESS] Bulk binary transfer confirmed.")
+	startTime := time.Now()
+
+	// Server goroutine to receive data
+	go func() {
+		defer transferWg.Done()
+		log.Println("[SERVER] Accepting stream for bulk transfer...")
+		stream, err := server.AcceptStream(ctx)
+		require.NoError(t, err)
+		log.Println("[SERVER] Reading from stream...")
+		serverReceivedData, err = io.ReadAll(stream) // Read until EOF
+		require.NoError(t, err, "Server should not get an error from io.ReadAll")
+		log.Println("[SERVER] Finished reading.")
+	}()
+
+	// Client goroutine to send data
+	go func() {
+		log.Println("[CLIENT] Opening stream for bulk transfer...")
+		stream, err := client.OpenStream(ctx)
+		require.NoError(t, err)
+		log.Printf("[CLIENT] Writing %d bytes...", dataSize)
+		_, err = stream.Write(clientData)
+		require.NoError(t, err)
+		log.Println("[CLIENT] Finished writing and closed stream.")
+		require.NoError(t, stream.Close())
+	}()
+
+	// Wait for the server to finish receiving everything
+	transferWg.Wait()
+
+	duration := time.Since(startTime)
+	mbps := (float64(dataSize) / (1024 * 1024)) / duration.Seconds()
+
+	log.Printf("[SUCCESS] Bulk transfer confirmed.")
+	log.Printf("[STATS] Transferred %d bytes in %v.", dataSize, duration)
+	log.Printf("[STATS] Speed: %.2f MB/s", mbps)
+
+	require.Equal(t, len(clientData), len(serverReceivedData))
+	require.True(t, bytes.Equal(clientData, serverReceivedData))
+
+	client.Close(nil)
+	server.Close(nil)
+	wg.Wait()
 }

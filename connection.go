@@ -143,13 +143,15 @@ func (c *Connection) Run(ctx context.Context) error {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		if err := c.receiveLoop(ctx); err != nil && err != context.Canceled && !errors.Is(err, io.EOF) {
+		err := c.receiveLoop(c.ctx)
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
 			errChan <- err
 		}
 	}()
 	go func() {
 		defer wg.Done()
-		if err := c.sendLoop(ctx); err != nil && err != context.Canceled {
+		err := c.sendLoop(c.ctx)
+		if err != nil && !errors.Is(err, context.Canceled) {
 			errChan <- err
 		}
 	}()
@@ -158,13 +160,13 @@ func (c *Connection) Run(ctx context.Context) error {
 	case err := <-errChan:
 		c.Close(err)
 		return err
-	case <-ctx.Done():
+	case <-ctx.Done(): // Context from the test timed out
 		c.Close(ctx.Err())
 		wg.Wait()
 		return ctx.Err()
-	case <-c.ctx.Done():
+	case <-c.ctx.Done(): // Connection's internal context was canceled by Close()
 		wg.Wait()
-		return c.ctx.Err()
+		return nil // Graceful shutdown
 	}
 }
 
@@ -240,7 +242,7 @@ func (c *Connection) handleFrames(payload []byte, encLevel protocol.EncryptionLe
 func (c *Connection) handleFrame(frame wire.Frame) {
 	switch f := frame.(type) {
 	case *wire.StreamFrame:
-		log.Printf("[RECV] Got STREAM frame for stream %d, len %d, fin: %t", f.StreamID, f.DataLen(), f.Fin)
+		// log.Printf("[RECV] Got STREAM frame for stream %d, len %d, fin: %t", f.StreamID, f.DataLen(), f.Fin)
 		c.streamsMu.RLock()
 		stream, ok := c.streams[f.StreamID]
 		c.streamsMu.RUnlock()
