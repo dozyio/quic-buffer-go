@@ -7,9 +7,9 @@ import (
 	"io"
 	"sync"
 
-	"github.com/dozyio/quic-buffer-go/flowcontrol"
-	"github.com/dozyio/quic-buffer-go/protocol"
-	"github.com/dozyio/quic-buffer-go/wire"
+	"github.com/dozyio/quic-buffer-go/internal/flowcontrol"
+	"github.com/dozyio/quic-buffer-go/internal/protocol"
+	"github.com/dozyio/quic-buffer-go/internal/wire"
 )
 
 // Stream is the application-facing object for a single bidirectional stream.

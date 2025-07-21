@@ -3,8 +3,8 @@ package main
 import (
 	"time"
 
-	"github.com/dozyio/quic-buffer-go/handshake"
-	"github.com/dozyio/quic-buffer-go/protocol"
+	"github.com/dozyio/quic-buffer-go/internal/handshake"
+	"github.com/dozyio/quic-buffer-go/internal/protocol"
 )
 
 // nullLongHeaderAEAD is a dummy AEAD for Initial and Handshake packets.

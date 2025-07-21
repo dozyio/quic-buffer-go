@@ -4,8 +4,8 @@ import (
 	"net"
 	"testing"
 
+	"github.com/dozyio/quic-buffer-go/internal/protocol"
 	. "github.com/dozyio/quic-buffer-go/logging"
-	"github.com/dozyio/quic-buffer-go/protocol"
 
 	"github.com/stretchr/testify/require"
 )

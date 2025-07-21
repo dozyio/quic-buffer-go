@@ -3,9 +3,9 @@ package logging_test
 import (
 	"testing"
 
+	"github.com/dozyio/quic-buffer-go/internal/protocol"
+	"github.com/dozyio/quic-buffer-go/internal/wire"
 	"github.com/dozyio/quic-buffer-go/logging"
-	"github.com/dozyio/quic-buffer-go/protocol"
-	"github.com/dozyio/quic-buffer-go/wire"
 	"github.com/stretchr/testify/require"
 )
 

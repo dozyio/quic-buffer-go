@@ -1,7 +1,7 @@
 package logging
 
 import (
-	"github.com/dozyio/quic-buffer-go/protocol"
+	"github.com/dozyio/quic-buffer-go/internal/protocol"
 )
 
 // PacketTypeFromHeader determines the packet type from a *wire.Header.

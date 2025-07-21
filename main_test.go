@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dozyio/quic-buffer-go/wire"
+	"github.com/dozyio/quic-buffer-go/internal/wire"
 	"github.com/stretchr/testify/require"
 )
 

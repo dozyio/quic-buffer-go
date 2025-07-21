@@ -3,10 +3,10 @@
 package logging
 
 import (
-	"github.com/dozyio/quic-buffer-go/protocol"
-	"github.com/dozyio/quic-buffer-go/qerr"
-	"github.com/dozyio/quic-buffer-go/utils"
-	"github.com/dozyio/quic-buffer-go/wire"
+	"github.com/dozyio/quic-buffer-go/internal/protocol"
+	"github.com/dozyio/quic-buffer-go/internal/qerr"
+	"github.com/dozyio/quic-buffer-go/internal/utils"
+	"github.com/dozyio/quic-buffer-go/internal/wire"
 )
 
 type (

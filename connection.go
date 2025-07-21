@@ -9,13 +9,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dozyio/quic-buffer-go/ackhandler"
-	"github.com/dozyio/quic-buffer-go/congestion"
-	"github.com/dozyio/quic-buffer-go/flowcontrol"
-	"github.com/dozyio/quic-buffer-go/handshake"
-	"github.com/dozyio/quic-buffer-go/protocol"
-	"github.com/dozyio/quic-buffer-go/utils"
-	"github.com/dozyio/quic-buffer-go/wire"
+	"github.com/dozyio/quic-buffer-go/internal/ackhandler"
+	"github.com/dozyio/quic-buffer-go/internal/congestion"
+	"github.com/dozyio/quic-buffer-go/internal/flowcontrol"
+	"github.com/dozyio/quic-buffer-go/internal/handshake"
+	"github.com/dozyio/quic-buffer-go/internal/protocol"
+	"github.com/dozyio/quic-buffer-go/internal/utils"
+	"github.com/dozyio/quic-buffer-go/internal/wire"
 )
 
 // dummyLogger is a no-op logger to satisfy quic-go's internal interfaces.
@@ -23,13 +23,13 @@ type dummyLogger struct{}
 
 func (l *dummyLogger) DropPacket(ptype protocol.PacketType, pn protocol.PacketNumber, reason string) {
 }
-func (l *dummyLogger) Debugf(format string, args ...interface{}) {}
-func (l *dummyLogger) Infof(format string, args ...interface{})  {}
-func (l *dummyLogger) Errorf(format string, args ...interface{}) {}
-func (l *dummyLogger) WithPrefix(prefix string) utils.Logger     { return l }
-func (l *dummyLogger) Debug() bool                               { return false }
-func (l *dummyLogger) SetLogLevel(level utils.LogLevel)          {}
-func (l *dummyLogger) SetLogTimeFormat(format string)            {}
+func (l *dummyLogger) Debugf(format string, args ...any)     {}
+func (l *dummyLogger) Infof(format string, args ...any)      {}
+func (l *dummyLogger) Errorf(format string, args ...any)     {}
+func (l *dummyLogger) WithPrefix(prefix string) utils.Logger { return l }
+func (l *dummyLogger) Debug() bool                           { return false }
+func (l *dummyLogger) SetLogLevel(level utils.LogLevel)      {}
+func (l *dummyLogger) SetLogTimeFormat(format string)        {}
 
 // Connection is the central object that manages the entire QUIC-like session.
 type Connection struct {
@@ -466,7 +466,7 @@ func (c *Connection) Close(err error) {
 
 // Simple buffer pool for packet payloads
 var packetBufferPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return new(bytes.Buffer)
 	},
 }

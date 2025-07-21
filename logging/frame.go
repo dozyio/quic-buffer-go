@@ -1,6 +1,6 @@
 package logging
 
-import "github.com/dozyio/quic-buffer-go/wire"
+import "github.com/dozyio/quic-buffer-go/internal/wire"
 
 // A Frame is a QUIC frame
 type Frame interface{}
