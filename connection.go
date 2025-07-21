@@ -440,11 +440,10 @@ func (c *Connection) newStream(id protocol.StreamID) *Stream {
 }
 
 // sendStreamData is called by a Stream to queue its data for sending.
-func (c *Connection) sendStreamData(id protocol.StreamID, data []byte, fin bool) {
-	// A real implementation would manage stream offsets and chunk data.
+func (c *Connection) sendStreamData(id protocol.StreamID, data []byte, fin bool, offset protocol.ByteCount) {
 	frame := &wire.StreamFrame{
 		StreamID:       id,
-		Offset:         0,
+		Offset:         offset,
 		Data:           data,
 		Fin:            fin,
 		DataLenPresent: true,

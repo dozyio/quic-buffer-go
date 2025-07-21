@@ -26,9 +26,9 @@ type Stream struct {
 	readErr    error
 
 	// Write-side
-	writeMu    sync.Mutex
-	writeChunk func([]byte, bool) // Function to send data to the connection
-	writeErr   error
+	writeMu     sync.Mutex
+	writeOffset protocol.ByteCount
+	writeErr    error
 
 	// Flow control
 	flowController flowcontrol.StreamFlowController
@@ -83,10 +83,22 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 		return 0, s.writeErr
 	}
 
-	// Simple implementation: send the whole chunk at once.
-	// A real implementation would handle flow control and packet size limits.
-	s.conn.sendStreamData(s.streamID, p, false) // fin = false
-	return len(p), nil
+	const maxDataSize = 1100 // A conservative chunk size to leave room for packet headers.
+
+	var totalSent int
+	for len(p) > 0 {
+		chunkSize := maxDataSize
+		if len(p) < chunkSize {
+			chunkSize = len(p)
+		}
+		chunk := p[:chunkSize]
+		p = p[chunkSize:]
+
+		s.conn.sendStreamData(s.streamID, chunk, false, s.writeOffset)
+		s.writeOffset += protocol.ByteCount(len(chunk))
+		totalSent += len(chunk)
+	}
+	return totalSent, nil
 }
 
 // Close signals that no more data will be written to the stream.
@@ -97,7 +109,7 @@ func (s *Stream) Close() error {
 	if s.writeErr != nil {
 		return s.writeErr
 	}
-	s.conn.sendStreamData(s.streamID, nil, true) // fin = true
+	s.conn.sendStreamData(s.streamID, nil, true, s.writeOffset) // fin = true
 	s.writeErr = errors.New("stream closed")
 	return nil
 }
