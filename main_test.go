@@ -258,7 +258,7 @@ func TestBulkBinaryTransfer(t *testing.T) {
 	log.Println("[TEST] Handshake complete for both peers.")
 
 	// Data transfer
-	const dataSize = 10 * 1024 * 1024 // 10 MB
+	const dataSize = 100 * 1024 * 1024 // 10 MB
 	clientData := make([]byte, dataSize)
 	_, err = rand.Read(clientData)
 	require.NoError(t, err)
@@ -312,10 +312,10 @@ func TestBulkBinaryTransfer(t *testing.T) {
 
 func TestUnreliableBulkTransfer(t *testing.T) {
 	const (
-		latency        = 1 * time.Millisecond
-		jitter         = 1 * time.Millisecond
-		packetLossRate = 0.05
-		dataSize       = 1 * 1024 * 1024
+		latency        = 20 * time.Millisecond
+		jitter         = 5 * time.Millisecond
+		packetLossRate = 0.03
+		dataSize       = 10 * 1024 * 1024
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second) // Longer timeout

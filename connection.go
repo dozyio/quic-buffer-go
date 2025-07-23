@@ -521,7 +521,7 @@ func (c *Connection) packAndSendPacket(frames []wire.Frame) (remainingFrames []w
 	payload := sealer.Seal(nil, payloadBuf.Bytes(), pn, raw)
 	raw = append(raw, payload...)
 
-	log.Printf("[SEND] Sending packet %d with %d frames.", pn, len(framesInPacket))
+	// log.Printf("[SEND] Sending packet %d with %d frames.", pn, len(framesInPacket))
 	err = c.transport.WritePacket(raw)
 	if err != nil {
 		return nil, err

@@ -72,9 +72,9 @@ func (s *Stream) Read(p []byte) (n int, err error) {
 			log.Printf("[STREAM %d] Read returning EOF. Total bytes read: %d", s.streamID, s.bytesRead)
 			return 0, io.EOF
 		}
-		log.Printf("[STREAM %d] Read waiting. Buffer len: %d, Bytes read: %d, Final size: %d, Finished: %t", s.streamID, s.readBuffer.Len(), s.bytesRead, s.finalSize, s.isFinished)
+		// log.Printf("[STREAM %d] Read waiting. Buffer len: %d, Bytes read: %d, Final size: %d, Finished: %t", s.streamID, s.readBuffer.Len(), s.bytesRead, s.finalSize, s.isFinished)
 		s.readCond.Wait()
-		log.Printf("[STREAM %d] Read woken up.", s.streamID)
+		// log.Printf("[STREAM %d] Read woken up.", s.streamID)
 	}
 
 	if s.readErr != nil {
@@ -83,7 +83,7 @@ func (s *Stream) Read(p []byte) (n int, err error) {
 
 	n, err = s.readBuffer.Read(p)
 	s.bytesRead += protocol.ByteCount(n)
-	log.Printf("[STREAM %d] Read %d bytes. Total bytes read: %d", s.streamID, n, s.bytesRead)
+	// log.Printf("[STREAM %d] Read %d bytes. Total bytes read: %d", s.streamID, n, s.bytesRead)
 	return n, err
 }
 
@@ -136,7 +136,7 @@ func (s *Stream) handleStreamFrame(frame *wire.StreamFrame) {
 			log.Printf("[STREAM %d] Ignoring duplicate frame at offset %d", s.streamID, frame.Offset)
 			return
 		}
-		log.Printf("[STREAM %d] Buffering frame at offset %d, len %d", s.streamID, frame.Offset, frame.DataLen())
+		// log.Printf("[STREAM %d] Buffering frame at offset %d, len %d", s.streamID, frame.Offset, frame.DataLen())
 		s.receiveBuffer[frame.Offset] = frame.Data
 	}
 
@@ -158,13 +158,13 @@ func (s *Stream) reassemble() {
 	}
 	sort.Slice(offsets, func(i, j int) bool { return offsets[i] < offsets[j] })
 
-	log.Printf("[STREAM %d] Reassembling. Current read offset: %d. Buffered offsets: %v", s.streamID, s.readOffset, offsets)
+	// log.Printf("[STREAM %d] Reassembling. Current read offset: %d. Buffered offsets: %v", s.streamID, s.readOffset, offsets)
 	for _, offset := range offsets {
 		if offset == s.readOffset {
 			data := s.receiveBuffer[offset]
 			s.readBuffer.Write(data)
 			s.readOffset += protocol.ByteCount(len(data))
-			log.Printf("[STREAM %d] Reassembled frame at offset %d. New read offset: %d", s.streamID, offset, s.readOffset)
+			// log.Printf("[STREAM %d] Reassembled frame at offset %d. New read offset: %d", s.streamID, offset, s.readOffset)
 			delete(s.receiveBuffer, offset)
 		} else if offset < s.readOffset {
 			delete(s.receiveBuffer, offset)
