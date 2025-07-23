@@ -78,8 +78,12 @@ type Connection struct {
 	closeChan           chan struct{}
 	logger              utils.Logger
 
+	// Handshake State
 	handshakeComplete     bool
 	handshakeCompleteChan chan struct{}
+	handshakeTimer        *time.Timer
+	handshakeTimeout      time.Duration
+	initialPacketSent     bool // New flag
 }
 
 // NewConnection creates and initializes a new connection.
@@ -108,6 +112,7 @@ func NewConnection(transport LowerLayerTransport, isClient bool) (*Connection, e
 		closeChan:             make(chan struct{}),
 		logger:                logger,
 		handshakeCompleteChan: make(chan struct{}),
+		handshakeTimeout:      2 * time.Second, // Timeout for initial PING
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	c.retransmissionQueue = newRetransmissionQueue(c)
@@ -227,6 +232,11 @@ func (c *Connection) receiveLoop(ctx context.Context) error {
 			c.ackMu.Lock()
 			if c.isClient && !c.handshakeComplete {
 				c.handshakeComplete = true
+				if c.handshakeTimer != nil {
+					// Stop the timer as soon as we get a response from the server.
+					c.handshakeTimer.Stop()
+					log.Println("[TIMER] Handshake timer stopped.")
+				}
 				close(c.handshakeCompleteChan)
 			}
 			c.ackMu.Unlock()
@@ -312,16 +322,35 @@ func (c *Connection) handleFrame(frame wire.Frame, encLevel protocol.EncryptionL
 	}
 }
 
-// sendLoop is the main event loop for sending packets.
 func (c *Connection) sendLoop(ctx context.Context) error {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 
+	// This is set to a non-nil channel only once the timer is started.
+	var handshakeTimerChan <-chan time.Time
+
 	for {
+		// Lazily get the timer channel.
+		// It will be nil until the timer is created in packAndSendPacket.
+		c.ackMu.Lock()
+		if c.handshakeTimer != nil {
+			handshakeTimerChan = c.handshakeTimer.C
+		}
+		c.ackMu.Unlock()
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
+		case <-handshakeTimerChan:
+			c.ackMu.Lock()
+			// Check if the handshake is still not complete.
+			if !c.handshakeComplete {
+				log.Println("[TEST] Handshake timeout, resending PING...")
+				c.sendQueue <- &wire.PingFrame{}
+				c.handshakeTimer.Reset(c.handshakeTimeout)
+			}
+			c.ackMu.Unlock()
 		}
 
 		if err := c.sendPackets(); err != nil {
@@ -462,6 +491,15 @@ func (c *Connection) packAndSendPacket(frames []wire.Frame) (remainingFrames []w
 			PacketNumberLen: pnLen,
 		}
 		raw, err = hdr.Append(nil, protocol.Version1)
+
+		// If this is the client's first packet, start the handshake timer.
+		c.ackMu.Lock()
+		if c.isClient && !c.initialPacketSent {
+			c.initialPacketSent = true
+			c.handshakeTimer = time.NewTimer(c.handshakeTimeout)
+			log.Println("[TIMER] Handshake timer started.")
+		}
+		c.ackMu.Unlock()
 	} else {
 		sealer = c.shortHeaderSealer
 		raw, err = wire.AppendShortHeader(nil, c.destConnID, pn, pnLen, c.shortHeaderSealer.KeyPhase())
