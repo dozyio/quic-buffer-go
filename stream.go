@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
+	"sort"
 	"sync"
 
 	"github.com/dozyio/quic-buffer-go/internal/flowcontrol"
@@ -13,17 +15,20 @@ import (
 )
 
 // Stream is the application-facing object for a single bidirectional stream.
-// It buffers read and write data and interacts with the connection's flow controller.
 type Stream struct {
 	streamID protocol.StreamID
 	conn     *Connection // The parent connection
 
 	// Read-side
-	readMu     sync.Mutex
-	readBuffer *bytes.Buffer
-	readCond   *sync.Cond // Notifies when new data arrives
-	isFinished bool       // True if a FIN has been received
-	readErr    error
+	readMu        sync.Mutex
+	readBuffer    *bytes.Buffer
+	readCond      *sync.Cond
+	isFinished    bool
+	readErr       error
+	finalSize     protocol.ByteCount
+	bytesRead     protocol.ByteCount
+	readOffset    protocol.ByteCount
+	receiveBuffer map[protocol.ByteCount][]byte
 
 	// Write-side
 	writeMu     sync.Mutex
@@ -44,6 +49,8 @@ func newStream(ctx context.Context, streamID protocol.StreamID, conn *Connection
 		conn:           conn,
 		readBuffer:     new(bytes.Buffer),
 		flowController: flowController,
+		finalSize:      protocol.MaxByteCount,
+		receiveBuffer:  make(map[protocol.ByteCount][]byte),
 	}
 	s.ctx, s.cancel = context.WithCancel(ctx)
 	s.readCond = sync.NewCond(&s.readMu)
@@ -60,24 +67,24 @@ func (s *Stream) Read(p []byte) (n int, err error) {
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
 
-	// Wait until the buffer has data, the stream is finished, or an error has occurred.
-	for s.readBuffer.Len() == 0 && !s.isFinished && s.readErr == nil {
+	for s.readBuffer.Len() == 0 && s.readErr == nil {
+		if s.isFinished && s.bytesRead == s.finalSize {
+			log.Printf("[STREAM %d] Read returning EOF. Total bytes read: %d", s.streamID, s.bytesRead)
+			return 0, io.EOF
+		}
+		log.Printf("[STREAM %d] Read waiting. Buffer len: %d, Bytes read: %d, Final size: %d, Finished: %t", s.streamID, s.readBuffer.Len(), s.bytesRead, s.finalSize, s.isFinished)
 		s.readCond.Wait()
+		log.Printf("[STREAM %d] Read woken up.", s.streamID)
 	}
 
-	// If there's data in the buffer, read it and return.
-	// This takes priority over EOF or errors.
-	if s.readBuffer.Len() > 0 {
-		return s.readBuffer.Read(p)
+	if s.readErr != nil {
+		return 0, s.readErr
 	}
 
-	// If the stream is finished (and the buffer is empty), return EOF.
-	if s.isFinished {
-		return 0, io.EOF
-	}
-
-	// Otherwise, return the error that woke us up.
-	return 0, s.readErr
+	n, err = s.readBuffer.Read(p)
+	s.bytesRead += protocol.ByteCount(n)
+	log.Printf("[STREAM %d] Read %d bytes. Total bytes read: %d", s.streamID, n, s.bytesRead)
+	return n, err
 }
 
 // Write writes data to the stream. It may block if flow control prevents sending.
@@ -89,7 +96,7 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 		return 0, s.writeErr
 	}
 
-	const maxDataSize = 1300 // A conservative chunk size to leave room for packet headers.
+	const maxDataSize = 1100
 
 	var totalSent int
 	for len(p) > 0 {
@@ -108,14 +115,13 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 }
 
 // Close signals that no more data will be written to the stream.
-// This will cause a STREAM frame with the FIN bit set to be sent.
 func (s *Stream) Close() error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if s.writeErr != nil {
 		return s.writeErr
 	}
-	s.conn.sendStreamData(s.streamID, nil, true, s.writeOffset) // fin = true
+	s.conn.sendStreamData(s.streamID, nil, true, s.writeOffset)
 	s.writeErr = errors.New("stream closed")
 	return nil
 }
@@ -126,15 +132,47 @@ func (s *Stream) handleStreamFrame(frame *wire.StreamFrame) {
 	defer s.readMu.Unlock()
 
 	if frame.DataLen() > 0 {
-		// A real implementation would check flow control limits here.
-		s.readBuffer.Write(frame.Data)
-	}
-	if frame.Fin {
-		s.isFinished = true
+		if frame.Offset+frame.DataLen() <= s.readOffset {
+			log.Printf("[STREAM %d] Ignoring duplicate frame at offset %d", s.streamID, frame.Offset)
+			return
+		}
+		log.Printf("[STREAM %d] Buffering frame at offset %d, len %d", s.streamID, frame.Offset, frame.DataLen())
+		s.receiveBuffer[frame.Offset] = frame.Data
 	}
 
-	// Signal any waiting Read() calls that data is available or the stream is finished.
+	if frame.Fin {
+		s.isFinished = true
+		s.finalSize = frame.Offset + frame.DataLen()
+		log.Printf("[STREAM %d] Received FIN. Final size: %d", s.streamID, s.finalSize)
+	}
+
+	s.reassemble()
 	s.readCond.Broadcast()
+}
+
+// reassemble checks the receive buffer for contiguous data and moves it to the read buffer.
+func (s *Stream) reassemble() {
+	offsets := make([]protocol.ByteCount, 0, len(s.receiveBuffer))
+	for offset := range s.receiveBuffer {
+		offsets = append(offsets, offset)
+	}
+	sort.Slice(offsets, func(i, j int) bool { return offsets[i] < offsets[j] })
+
+	log.Printf("[STREAM %d] Reassembling. Current read offset: %d. Buffered offsets: %v", s.streamID, s.readOffset, offsets)
+	for _, offset := range offsets {
+		if offset == s.readOffset {
+			data := s.receiveBuffer[offset]
+			s.readBuffer.Write(data)
+			s.readOffset += protocol.ByteCount(len(data))
+			log.Printf("[STREAM %d] Reassembled frame at offset %d. New read offset: %d", s.streamID, offset, s.readOffset)
+			delete(s.receiveBuffer, offset)
+		} else if offset < s.readOffset {
+			delete(s.receiveBuffer, offset)
+		} else {
+			log.Printf("[STREAM %d] Gap in stream. Expected offset %d, found %d. Stopping reassembly.", s.streamID, s.readOffset, offset)
+			break
+		}
+	}
 }
 
 // cancelRead is called when the connection is closed.

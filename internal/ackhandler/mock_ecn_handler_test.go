@@ -12,7 +12,7 @@ package ackhandler
 import (
 	reflect "reflect"
 
-	protocol "github.com/dozyio/quic-buffer-go/protocol"
+	protocol "github.com/dozyio/quic-buffer-go/internal/protocol"
 	gomock "go.uber.org/mock/gomock"
 )
 

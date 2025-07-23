@@ -18,6 +18,18 @@ import (
 	"github.com/dozyio/quic-buffer-go/internal/wire"
 )
 
+// retransmissionHandler implements the ackhandler.FrameHandler interface.
+type retransmissionHandler struct {
+	conn *Connection
+}
+
+func (h *retransmissionHandler) OnAcked(f wire.Frame) {}
+
+func (h *retransmissionHandler) OnLost(f wire.Frame) {
+	log.Printf("[RETRANS] Re-queuing lost frame of type %T", f)
+	h.conn.retransmissionQueue.Add(f)
+}
+
 // dummyLogger is a no-op logger to satisfy quic-go's internal interfaces.
 type dummyLogger struct{}
 
@@ -61,9 +73,10 @@ type Connection struct {
 	shortHeaderOpener handshake.ShortHeaderOpener
 
 	// Data to send
-	sendQueue chan wire.Frame
-	closeChan chan struct{}
-	logger    utils.Logger
+	sendQueue           chan wire.Frame
+	retransmissionQueue *retransmissionQueue
+	closeChan           chan struct{}
+	logger              utils.Logger
 
 	handshakeComplete     bool
 	handshakeCompleteChan chan struct{}
@@ -97,6 +110,7 @@ func NewConnection(transport LowerLayerTransport, isClient bool) (*Connection, e
 		handshakeCompleteChan: make(chan struct{}),
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
+	c.retransmissionQueue = newRetransmissionQueue(c)
 
 	c.congestionController = congestion.NewCubicSender(
 		congestion.DefaultClock{},
@@ -210,7 +224,6 @@ func (c *Connection) receiveLoop(ctx context.Context) error {
 			c.ackMu.Unlock()
 			c.handleFrames(payload, encLevel)
 		} else {
-			// This is a 1-RTT packet, which is the signal for the client that the handshake is complete.
 			c.ackMu.Lock()
 			if c.isClient && !c.handshakeComplete {
 				c.handshakeComplete = true
@@ -255,13 +268,9 @@ func (c *Connection) handleFrames(payload []byte, encLevel protocol.EncryptionLe
 	}
 }
 
-// handleFrame processes a single parsed frame.
 func (c *Connection) handleFrame(frame wire.Frame, encLevel protocol.EncryptionLevel) {
-	// Most logic is now guarded by the ackMu in the calling functions.
-	// Be careful about re-introducing locks here without careful thought.
 	switch f := frame.(type) {
 	case *wire.StreamFrame:
-		log.Printf("[RECV] Got STREAM frame for stream %d, len %d, fin: %t", f.StreamID, f.DataLen(), f.Fin)
 		c.streamsMu.RLock()
 		stream, ok := c.streams[f.StreamID]
 		c.streamsMu.RUnlock()
@@ -284,8 +293,7 @@ func (c *Connection) handleFrame(frame wire.Frame, encLevel protocol.EncryptionL
 	case *wire.AckFrame:
 		c.ackMu.Lock()
 		log.Printf("[RECV] Got ACK frame for %s level, acknowledging ranges: %v", encLevel, f.AckRanges)
-		_, err := c.sentPacketHandler.ReceivedAck(f, encLevel, time.Now())
-		if err != nil {
+		if _, err := c.sentPacketHandler.ReceivedAck(f, encLevel, time.Now()); err != nil {
 			log.Printf("Error processing ACK frame: %v", err)
 		}
 		c.ackMu.Unlock()
@@ -304,54 +312,71 @@ func (c *Connection) handleFrame(frame wire.Frame, encLevel protocol.EncryptionL
 	}
 }
 
-// sendLoop continuously bundles frames from the sendQueue into packets and sends them.
+// sendLoop is the main event loop for sending packets.
 func (c *Connection) sendLoop(ctx context.Context) error {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 
-	var frames []wire.Frame
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case frame := <-c.sendQueue:
-			frames = append(frames, frame)
 		case <-ticker.C:
 		}
 
-	Drain:
-		for {
-			select {
-			case frame := <-c.sendQueue:
-				frames = append(frames, frame)
-			default:
-				break Drain
-			}
-		}
-
-		c.ackMu.Lock()
-		if ack := c.receivedPacketHandler.GetAckFrame(protocol.EncryptionInitial, time.Now(), false); ack != nil {
-			log.Printf("[SEND] Queuing Initial ACK frame for ranges: %v", ack.AckRanges)
-			frames = append([]wire.Frame{ack}, frames...)
-		}
-		if ack := c.receivedPacketHandler.GetAckFrame(protocol.Encryption1RTT, time.Now(), false); ack != nil {
-			log.Printf("[SEND] Queuing 1-RTT ACK frame for ranges: %v", ack.AckRanges)
-			frames = append([]wire.Frame{ack}, frames...)
-		}
-		c.ackMu.Unlock()
-
-		if len(frames) == 0 {
-			continue
-		}
-
-		for len(frames) > 0 {
-			var err error
-			frames, err = c.packAndSendPacket(frames)
-			if err != nil {
-				return err
-			}
+		if err := c.sendPackets(); err != nil {
+			return err
 		}
 	}
+}
+
+func (c *Connection) sendPackets() error {
+	c.ackMu.Lock()
+	if err := c.sentPacketHandler.OnLossDetectionTimeout(time.Now()); err != nil {
+		log.Printf("Loss detection error: %v", err)
+	}
+	c.ackMu.Unlock()
+
+	var frames []wire.Frame
+
+	// Priority 1: ACKs
+	c.ackMu.Lock()
+	if ack := c.receivedPacketHandler.GetAckFrame(protocol.EncryptionInitial, time.Now(), false); ack != nil {
+		frames = append(frames, ack)
+	}
+	if ack := c.receivedPacketHandler.GetAckFrame(protocol.Encryption1RTT, time.Now(), false); ack != nil {
+		frames = append(frames, ack)
+	}
+	c.ackMu.Unlock()
+
+	// Priority 2: Retransmissions
+	for c.retransmissionQueue.HasData() {
+		frames = append(frames, c.retransmissionQueue.GetFrame())
+	}
+
+	// Priority 3: New Data
+DrainNewData:
+	for {
+		select {
+		case frame := <-c.sendQueue:
+			frames = append(frames, frame)
+		default:
+			break DrainNewData
+		}
+	}
+
+	if len(frames) == 0 {
+		return nil
+	}
+
+	for len(frames) > 0 {
+		var err error
+		frames, err = c.packAndSendPacket(frames)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *Connection) packAndSendPacket(frames []wire.Frame) (remainingFrames []wire.Frame, err error) {
@@ -380,15 +405,12 @@ func (c *Connection) packAndSendPacket(frames []wire.Frame) (remainingFrames []w
 	var cutoff int
 
 	maxPacketSize := protocol.InitialPacketSize - 40
+	handler := c.retransmissionQueue.FrameHandler(encLevel)
 
 	for i, frame := range frames {
 		if _, isStream := frame.(*wire.StreamFrame); isStream && encLevel == protocol.EncryptionInitial {
 			continue
 		}
-		if _, isAck := frame.(*wire.AckFrame); isAck && encLevel == protocol.EncryptionInitial {
-			// This is a simplification. A real implementation would handle coalescing.
-		}
-
 		frameLen := int(frame.Length(protocol.Version1))
 		if payloadLength+frameLen > maxPacketSize && payloadLength > 0 {
 			break
@@ -396,7 +418,10 @@ func (c *Connection) packAndSendPacket(frames []wire.Frame) (remainingFrames []w
 
 		payloadLength += frameLen
 		framesInPacket = append(framesInPacket, frame)
-		ackFramesInPacket = append(ackFramesInPacket, ackhandler.Frame{Frame: frame})
+		ackFramesInPacket = append(ackFramesInPacket, ackhandler.Frame{
+			Frame:   frame,
+			Handler: handler,
+		})
 		cutoff = i + 1
 	}
 
@@ -446,8 +471,9 @@ func (c *Connection) packAndSendPacket(frames []wire.Frame) (remainingFrames []w
 	}
 
 	c.ackMu.Lock()
+	var streamFrames []ackhandler.StreamFrame
 	c.sentPacketHandler.SentPacket(
-		time.Now(), pn, protocol.InvalidPacketNumber, nil, ackFramesInPacket,
+		time.Now(), pn, protocol.InvalidPacketNumber, streamFrames, ackFramesInPacket,
 		encLevel, protocol.ECNUnsupported, protocol.ByteCount(payloadBuf.Len()+len(raw)+overhead),
 		true,
 		false,

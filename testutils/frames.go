@@ -1,6 +1,6 @@
 package testutils
 
-import "github.com/dozyio/quic-buffer-go/wire"
+import "github.com/dozyio/quic-buffer-go/internal/wire"
 
 type (
 	Frame                   = wire.Frame

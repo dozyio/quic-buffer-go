@@ -4,9 +4,9 @@ import (
 	"testing"
 
 	mocklogging "github.com/dozyio/quic-buffer-go/internal/mocks/logging"
+	"github.com/dozyio/quic-buffer-go/internal/protocol"
+	"github.com/dozyio/quic-buffer-go/internal/utils"
 	"github.com/dozyio/quic-buffer-go/logging"
-	"github.com/dozyio/quic-buffer-go/protocol"
-	"github.com/dozyio/quic-buffer-go/utils"
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"

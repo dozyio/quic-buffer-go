@@ -6,9 +6,9 @@ package testutils
 import (
 	"fmt"
 
-	"github.com/dozyio/quic-buffer-go/handshake"
-	"github.com/dozyio/quic-buffer-go/protocol"
-	"github.com/dozyio/quic-buffer-go/wire"
+	"github.com/dozyio/quic-buffer-go/internal/handshake"
+	"github.com/dozyio/quic-buffer-go/internal/protocol"
+	"github.com/dozyio/quic-buffer-go/internal/wire"
 )
 
 // writePacket returns a new raw packet with the specified header and payload
