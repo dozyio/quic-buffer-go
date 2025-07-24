@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"io"
+	"log"
 	mrand "math/rand"
 	"sync"
 	"sync/atomic"
@@ -109,6 +110,7 @@ type adverseTransport struct {
 	duplicateRate float64
 	reorderRate   float64
 	r             *mrand.Rand
+	randLock      sync.Mutex
 	reorderBuffer [][]byte
 	reorderLock   sync.Mutex
 	wg            sync.WaitGroup
@@ -145,21 +147,26 @@ func (t *adverseTransport) WritePacket(p []byte) error {
 	go func() {
 		defer t.wg.Done()
 
+		t.randLock.Lock()
 		delay := t.latency
 		if t.jitter > 0 {
 			delay += time.Duration(t.r.Int63n(int64(t.jitter)))
 		}
+		shouldDrop := t.r.Float64() < t.lossRate
+		shouldReorder := t.r.Float64() < t.reorderRate
+		shouldDuplicate := t.r.Float64() < t.duplicateRate
+		t.randLock.Unlock()
+
 		time.Sleep(delay)
 
-		if t.r.Float64() < t.lossRate {
+		if shouldDrop {
 			return
 		}
 
-		// **CRITICAL FIX**: Do not reorder the first few packets to allow the handshake to complete.
 		isHandshake := packetNum <= 4
 
 		t.reorderLock.Lock()
-		if !isHandshake && t.r.Float64() < t.reorderRate {
+		if !isHandshake && shouldReorder {
 			t.reorderBuffer = append(t.reorderBuffer, pCopy)
 			if len(t.reorderBuffer) > 1 {
 				pktToSend := t.reorderBuffer[0]
@@ -173,7 +180,7 @@ func (t *adverseTransport) WritePacket(p []byte) error {
 
 		t.underlying.WritePacket(pCopy)
 
-		if !isHandshake && t.r.Float64() < t.duplicateRate {
+		if !isHandshake && shouldDuplicate {
 			time.Sleep(5 * time.Millisecond)
 			t.underlying.WritePacket(pCopy)
 		}
@@ -216,10 +223,6 @@ func (r *pacedReader) Read(p []byte) (n int, err error) {
 	}
 	return
 }
-
-// #############################################################################
-// ##                   EXISTING TESTS (UNCHANGED)                            ##
-// #############################################################################
 
 func TestTextMessageTransfer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -298,6 +301,9 @@ func TestBulkTransfer(t *testing.T) {
 	var serverReceivedData []byte
 	var transferWg sync.WaitGroup
 	transferWg.Add(1)
+
+	startTime := time.Now()
+
 	go func() {
 		defer transferWg.Done()
 		stream, err := server.AcceptStream(ctx)
@@ -312,7 +318,15 @@ func TestBulkTransfer(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, stream.Close())
 	}()
+
 	transferWg.Wait()
+
+	duration := time.Since(startTime)
+	mbps := (float64(dataSize) / (1024 * 1024)) / duration.Seconds()
+	log.Printf("[SUCCESS] Bulk transfer confirmed.")
+	log.Printf("[STATS] Transferred %d bytes in %v.", dataSize, duration)
+	log.Printf("[STATS] Speed: %.2f MB/s", mbps)
+
 	require.Equal(t, len(clientData), len(serverReceivedData))
 	require.True(t, bytes.Equal(clientData, serverReceivedData))
 	client.Close(nil)
@@ -320,9 +334,94 @@ func TestBulkTransfer(t *testing.T) {
 	wg.Wait()
 }
 
-// #############################################################################
-// ##            FIXED TESTS FOR ADVERSE CONDITIONS                           ##
-// #############################################################################
+func TestUnreliableBulkTransfer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	underlyingTransport := newMockTransport()
+	clientTransport := newAdverseTransport(underlyingTransport, 20*time.Millisecond, 10*time.Millisecond, 0.03, 0.02, 0.02)
+	serverTransport := newAdverseTransport(underlyingTransport.Inverted(), 20*time.Millisecond, 10*time.Millisecond, 0.03, 0.02, 0.02)
+
+	client, err := NewConnection(clientTransport, true)
+	require.NoError(t, err)
+	server, err := NewConnection(serverTransport, false)
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		err := client.Run(ctx)
+		require.True(t, err == nil || err == context.Canceled || err == context.DeadlineExceeded || errors.Is(err, io.EOF))
+	}()
+	go func() {
+		defer wg.Done()
+		err := server.Run(ctx)
+		require.True(t, err == nil || err == context.Canceled || err == context.DeadlineExceeded || errors.Is(err, io.EOF))
+	}()
+
+	client.sendQueue <- &wire.PingFrame{}
+	<-client.handshakeCompleteChan
+	<-server.handshakeCompleteChan
+
+	const dataSize = 5 * 1024 * 1024 // 5 MB
+	clientData := make([]byte, dataSize)
+	_, err = rand.Read(clientData)
+	require.NoError(t, err)
+
+	var serverReceivedData []byte
+	var transferWg sync.WaitGroup
+	transferWg.Add(1)
+
+	startTime := time.Now()
+
+	go func() {
+		defer transferWg.Done()
+		stream, err := server.AcceptStream(ctx)
+		require.NoError(t, err)
+		serverReceivedData, err = io.ReadAll(stream)
+		require.NoError(t, err)
+	}()
+
+	go func() {
+		stream, err := client.OpenStream(ctx)
+		require.NoError(t, err)
+
+		clientDataReader := bytes.NewReader(clientData)
+		pacedClientReader := &pacedReader{reader: clientDataReader, delay: 1 * time.Millisecond}
+		buf := make([]byte, 8*1024)
+		for {
+			n, readErr := pacedClientReader.Read(buf)
+			if n > 0 {
+				dataToWrite := make([]byte, n)
+				copy(dataToWrite, buf[:n])
+				_, writeErr := stream.Write(dataToWrite)
+				require.NoError(t, writeErr)
+			}
+			if readErr == io.EOF {
+				break
+			}
+			require.NoError(t, readErr)
+		}
+
+		require.NoError(t, stream.Close())
+	}()
+
+	transferWg.Wait()
+
+	duration := time.Since(startTime)
+	mbps := (float64(len(serverReceivedData)) / (1024 * 1024)) / duration.Seconds()
+	log.Printf("[SUCCESS] Unreliable bulk transfer confirmed.")
+	log.Printf("[STATS] Transferred %d bytes in %v over an unreliable network.", len(serverReceivedData), duration)
+	log.Printf("[STATS] Effective Speed: %.2f MB/s", mbps)
+
+	client.Close(nil)
+	server.Close(nil)
+	wg.Wait()
+
+	require.Equal(t, len(clientData), len(serverReceivedData))
+	require.True(t, bytes.Equal(clientData, serverReceivedData), "Data should be identical even over an unreliable link")
+}
 
 func TestHighPacketReordering(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
