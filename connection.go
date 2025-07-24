@@ -18,7 +18,6 @@ import (
 	"github.com/dozyio/quic-buffer-go/internal/wire"
 )
 
-// ... (retransmissionHandler and dummyLogger are correct) ...
 type retransmissionHandler struct {
 	conn *Connection
 }
@@ -66,11 +65,11 @@ type Connection struct {
 	logger                utils.Logger
 	handshakeComplete     bool
 	handshakeCompleteChan chan struct{}
-	handshakeTimer        *time.Timer // Restored
+	handshakeTimer        *time.Timer
 	handshakeTimeout      time.Duration
 	initialKeysDropped    bool
 	sendingScheduled      chan struct{}
-	initialPacketSent     bool // New flag to start the timer only once
+	initialPacketSent     bool
 }
 
 func NewConnection(transport LowerLayerTransport, isClient bool) (*Connection, error) {
@@ -95,7 +94,7 @@ func NewConnection(transport LowerLayerTransport, isClient bool) (*Connection, e
 		sendQueue:             make(chan wire.Frame, 10000),
 		logger:                logger,
 		handshakeCompleteChan: make(chan struct{}),
-		handshakeTimeout:      1 * time.Second, // A shorter timeout for faster retransmission
+		handshakeTimeout:      1 * time.Second,
 		sendingScheduled:      make(chan struct{}, 1),
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
@@ -161,6 +160,14 @@ func (c *Connection) receiveLoop(ctx context.Context) error {
 			handshakeCompletedInThisPacket bool
 		)
 		if wire.IsLongHeaderPacket(data[0]) {
+			c.ackMu.Lock()
+			// ** THE FIX **: Once keys are dropped, ignore any future Initial packets.
+			if c.initialKeysDropped {
+				c.ackMu.Unlock()
+				continue
+			}
+			c.ackMu.Unlock()
+
 			hdr, packetData, _, err := wire.ParsePacket(data)
 			if err != nil {
 				continue
@@ -244,14 +251,14 @@ func (c *Connection) handleFrame(frame wire.Frame, encLevel protocol.EncryptionL
 			c.streamsMu.Lock()
 			c.streams[f.StreamID] = stream
 			c.streamsMu.Unlock()
-			go stream.handleStreamFrame(f)
+			stream.handleStreamFrame(f)
 			select {
 			case c.acceptQueue <- stream:
 			default:
 				log.Printf("[%s] Accept queue full, dropping stream %d", c.side(), f.StreamID)
 			}
 		} else {
-			go stream.handleStreamFrame(f)
+			stream.handleStreamFrame(f)
 		}
 	case *wire.AckFrame:
 		c.ackMu.Lock()
@@ -368,19 +375,22 @@ func (c *Connection) packAndSendPacket(frames []wire.Frame, encLevel protocol.En
 	c.ackMu.Lock()
 	if encLevel == protocol.EncryptionInitial && c.initialKeysDropped {
 		c.ackMu.Unlock()
-		return nil, nil // Discard frames that can't be sent.
+		return nil, nil
 	}
 	pn, pnLen := c.sentPacketHandler.PeekPacketNumber(encLevel)
 	c.sentPacketHandler.PopPacketNumber(encLevel)
 	c.ackMu.Unlock()
-
 	var payloadLength int
 	var framesInPacket []wire.Frame
 	var ackFramesInPacket []ackhandler.Frame
 	var cutoff int
+	isAckEliciting := false
 	maxPacketSize := protocol.InitialPacketSize - 40
 	handler := c.retransmissionQueue.FrameHandler(encLevel)
 	for i, frame := range frames {
+		if _, isAck := frame.(*wire.AckFrame); !isAck {
+			isAckEliciting = true
+		}
 		frameLen := int(frame.Length(protocol.Version1))
 		if payloadLength+frameLen > maxPacketSize && payloadLength > 0 {
 			break
@@ -437,7 +447,7 @@ func (c *Connection) packAndSendPacket(frames []wire.Frame, encLevel protocol.En
 	c.sentPacketHandler.SentPacket(
 		time.Now(), pn, protocol.InvalidPacketNumber, nil, ackFramesInPacket,
 		encLevel, protocol.ECNUnsupported, protocol.ByteCount(payloadBuf.Len()+len(raw)+overhead),
-		false, false,
+		isAckEliciting, false,
 	)
 	c.ackMu.Unlock()
 	raw = append(raw, payload...)
