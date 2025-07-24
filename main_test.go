@@ -107,8 +107,10 @@ type unreliableTransport struct {
 	jitter         time.Duration
 	packetLossRate float64
 	r              *mrand.Rand
-	mu             sync.Mutex
-	wg             sync.WaitGroup // Use a WaitGroup to track in-flight packets
+
+	mu       sync.Mutex // Protects r, wg, and isClosed
+	wg       sync.WaitGroup
+	isClosed bool
 }
 
 func newUnreliableTransport(transport LowerLayerTransport, latency, jitter time.Duration, packetLossRate float64) *unreliableTransport {
@@ -122,15 +124,20 @@ func newUnreliableTransport(transport LowerLayerTransport, latency, jitter time.
 }
 
 func (t *unreliableTransport) WritePacket(p []byte) error {
-	// Make a copy immediately, as the original buffer will be reused by the caller.
+	t.mu.Lock()
+	if t.isClosed {
+		t.mu.Unlock()
+		return io.EOF
+	}
+	t.wg.Add(1)
+	t.mu.Unlock()
+
 	pCopy := make([]byte, len(p))
 	copy(pCopy, p)
 
-	t.wg.Add(1)
 	go func() {
 		defer t.wg.Done()
 
-		// Lock only to protect access to the shared random number generator.
 		t.mu.Lock()
 		shouldDrop := t.r.Float64() < t.packetLossRate
 		delay := t.latency
@@ -141,10 +148,9 @@ func (t *unreliableTransport) WritePacket(p []byte) error {
 
 		if shouldDrop {
 			// log.Println("[NET] Packet lost")
-			return // Just drop the packet
+			return
 		}
 
-		// Perform the delay and the write outside the lock.
 		time.Sleep(delay)
 		t.transport.WritePacket(pCopy)
 	}()
@@ -157,7 +163,14 @@ func (t *unreliableTransport) ReadPacket() ([]byte, error) {
 }
 
 func (t *unreliableTransport) Close() error {
-	// Wait for all in-flight packets to be written before closing the underlying transport.
+	t.mu.Lock()
+	if t.isClosed {
+		t.mu.Unlock()
+		return nil // Already closed
+	}
+	t.isClosed = true
+	t.mu.Unlock()
+
 	t.wg.Wait()
 	return t.transport.Close()
 }
