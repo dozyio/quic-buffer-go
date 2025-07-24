@@ -161,7 +161,6 @@ func (c *Connection) receiveLoop(ctx context.Context) error {
 		)
 		if wire.IsLongHeaderPacket(data[0]) {
 			c.ackMu.Lock()
-			// ** THE FIX **: Once keys are dropped, ignore any future Initial packets.
 			if c.initialKeysDropped {
 				c.ackMu.Unlock()
 				continue
@@ -228,7 +227,7 @@ func (c *Connection) receiveLoop(ctx context.Context) error {
 func (c *Connection) processFrames(frameParser *wire.FrameParser, payload []byte, encLevel protocol.EncryptionLevel) {
 	frameData := payload
 	for len(frameData) > 0 {
-		bytesRead, frame, err := frameParser.ParseNext(frameData, encLevel, protocol.Version1)
+		bytesRead, frame, err := frameParser.ParseNext(frameData, encLevel, protocol.Version2)
 		if err != nil {
 			break
 		}
@@ -391,7 +390,7 @@ func (c *Connection) packAndSendPacket(frames []wire.Frame, encLevel protocol.En
 		if _, isAck := frame.(*wire.AckFrame); !isAck {
 			isAckEliciting = true
 		}
-		frameLen := int(frame.Length(protocol.Version1))
+		frameLen := int(frame.Length(protocol.Version2))
 		if payloadLength+frameLen > maxPacketSize && payloadLength > 0 {
 			break
 		}
@@ -406,7 +405,7 @@ func (c *Connection) packAndSendPacket(frames []wire.Frame, encLevel protocol.En
 	payloadBuf := getPacketBuffer()
 	defer putPacketBuffer(payloadBuf)
 	for _, frame := range framesInPacket {
-		b, err := frame.Append(payloadBuf.Bytes(), protocol.Version1)
+		b, err := frame.Append(payloadBuf.Bytes(), protocol.Version2)
 		if err != nil {
 			return nil, err
 		}
@@ -422,11 +421,11 @@ func (c *Connection) packAndSendPacket(frames []wire.Frame, encLevel protocol.En
 			Header: wire.Header{
 				Type: protocol.PacketTypeInitial, DestConnectionID: c.destConnID, SrcConnectionID: c.destConnID,
 				Length:  protocol.ByteCount(payloadBuf.Len() + int(pnLen) + overhead),
-				Version: protocol.Version1,
+				Version: protocol.Version2,
 			},
 			PacketNumber: pn, PacketNumberLen: pnLen,
 		}
-		raw, err = hdr.Append(nil, protocol.Version1)
+		raw, err = hdr.Append(nil, protocol.Version2)
 		payload = c.longHeaderSealer.Seal(nil, payloadBuf.Bytes(), pn, raw)
 		c.ackMu.Lock()
 		if c.isClient && !c.initialPacketSent {
