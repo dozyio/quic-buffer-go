@@ -148,7 +148,7 @@ func (c *Connection) Run(ctx context.Context) error {
 }
 
 func (c *Connection) receiveLoop(ctx context.Context) error {
-	frameParser := wire.NewFrameParser(true, true)
+	frameParser := wire.NewFrameParser(false, true)
 	for {
 		data, err := c.transport.ReadPacket()
 		if err != nil {
