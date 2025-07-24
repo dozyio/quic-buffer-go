@@ -532,12 +532,12 @@ func TestPacketDuplication(t *testing.T) {
 }
 
 func TestExtremeLatencyVariation(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	underlying := newMockTransport()
-	clientTransport := newAdverseTransport(underlying, 50*time.Millisecond, 100*time.Millisecond, 0, 0, 0)
-	serverTransport := newAdverseTransport(underlying.Inverted(), 50*time.Millisecond, 100*time.Millisecond, 0, 0, 0)
+	clientTransport := newAdverseTransport(underlying, 5000*time.Millisecond, 100*time.Millisecond, 0, 0, 0)
+	serverTransport := newAdverseTransport(underlying.Inverted(), 5000*time.Millisecond, 100*time.Millisecond, 0, 0, 0)
 
 	client, err := NewConnection(clientTransport, true)
 	require.NoError(t, err)
