@@ -224,7 +224,7 @@ func TestTextMessageTransfer(t *testing.T) {
 	wg.Wait()
 }
 
-func TestBulkBinaryTransfer(t *testing.T) {
+func TestBulkTransfer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 

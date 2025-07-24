@@ -18,19 +18,17 @@ import (
 	"github.com/dozyio/quic-buffer-go/internal/wire"
 )
 
-// retransmissionHandler implements the ackhandler.FrameHandler interface.
+// ... (retransmissionHandler and dummyLogger are correct) ...
 type retransmissionHandler struct {
 	conn *Connection
 }
 
 func (h *retransmissionHandler) OnAcked(f wire.Frame) {}
-
 func (h *retransmissionHandler) OnLost(f wire.Frame) {
-	log.Printf("[RETRANS] Re-queuing lost frame of type %T", f)
+	log.Printf("[%s][RETRANS] Re-queuing lost frame of type %T", h.conn.side(), f)
 	h.conn.retransmissionQueue.Add(f)
 }
 
-// dummyLogger is a no-op logger to satisfy quic-go's internal interfaces.
 type dummyLogger struct{}
 
 func (l *dummyLogger) DropPacket(ptype protocol.PacketType, pn protocol.PacketNumber, reason string) {
@@ -43,60 +41,46 @@ func (l *dummyLogger) Debug() bool                           { return false }
 func (l *dummyLogger) SetLogLevel(level utils.LogLevel)      {}
 func (l *dummyLogger) SetLogTimeFormat(format string)        {}
 
-// Connection is the central object that manages the entire QUIC-like session.
 type Connection struct {
-	transport LowerLayerTransport
-	isClient  bool
-	ctx       context.Context
-	cancel    context.CancelFunc
-
-	// State
-	destConnID       protocol.ConnectionID
-	nextPacketNumber protocol.PacketNumber
-	nextStreamID     protocol.StreamID
-	streams          map[protocol.StreamID]*Stream
-	streamsMu        sync.RWMutex
-	acceptQueue      chan *Stream // For AcceptStream()
-
-	// quic-go components
+	transport             LowerLayerTransport
+	isClient              bool
+	ctx                   context.Context
+	cancel                context.CancelFunc
+	destConnID            protocol.ConnectionID
+	nextStreamID          protocol.StreamID
+	streams               map[protocol.StreamID]*Stream
+	streamsMu             sync.RWMutex
+	acceptQueue           chan *Stream
 	sentPacketHandler     ackhandler.SentPacketHandler
 	receivedPacketHandler ackhandler.ReceivedPacketHandler
-	ackMu                 sync.Mutex // Protects ack handlers and handshake state
+	ackMu                 sync.Mutex
 	congestionController  congestion.SendAlgorithmWithDebugInfos
 	connFlowController    flowcontrol.ConnectionFlowController
 	rttStats              *utils.RTTStats
-
-	// Dummy crypto
-	longHeaderSealer  handshake.LongHeaderSealer
-	longHeaderOpener  handshake.LongHeaderOpener
-	shortHeaderSealer handshake.ShortHeaderSealer
-	shortHeaderOpener handshake.ShortHeaderOpener
-
-	// Data to send
-	sendQueue           chan wire.Frame
-	retransmissionQueue *retransmissionQueue
-	closeChan           chan struct{}
-	logger              utils.Logger
-
-	// Handshake State
+	longHeaderSealer      handshake.LongHeaderSealer
+	longHeaderOpener      handshake.LongHeaderOpener
+	shortHeaderSealer     handshake.ShortHeaderSealer
+	shortHeaderOpener     handshake.ShortHeaderOpener
+	sendQueue             chan wire.Frame
+	retransmissionQueue   *retransmissionQueue
+	logger                utils.Logger
 	handshakeComplete     bool
 	handshakeCompleteChan chan struct{}
-	handshakeTimer        *time.Timer
+	handshakeTimer        *time.Timer // Restored
 	handshakeTimeout      time.Duration
-	initialPacketSent     bool // New flag
+	initialKeysDropped    bool
+	sendingScheduled      chan struct{}
+	initialPacketSent     bool // New flag to start the timer only once
 }
 
-// NewConnection creates and initializes a new connection.
 func NewConnection(transport LowerLayerTransport, isClient bool) (*Connection, error) {
 	connID, _ := protocol.GenerateConnectionID(8)
 	logger := &dummyLogger{}
 	rttStats := &utils.RTTStats{}
-
 	perspective := protocol.PerspectiveClient
 	if !isClient {
 		perspective = protocol.PerspectiveServer
 	}
-
 	c := &Connection{
 		transport:             transport,
 		isClient:              isClient,
@@ -109,57 +93,32 @@ func NewConnection(transport LowerLayerTransport, isClient bool) (*Connection, e
 		shortHeaderSealer:     &nullShortHeaderAEAD{},
 		shortHeaderOpener:     &nullShortHeaderAEAD{},
 		sendQueue:             make(chan wire.Frame, 10000),
-		closeChan:             make(chan struct{}),
 		logger:                logger,
 		handshakeCompleteChan: make(chan struct{}),
-		handshakeTimeout:      2 * time.Second, // Timeout for initial PING
+		handshakeTimeout:      1 * time.Second, // A shorter timeout for faster retransmission
+		sendingScheduled:      make(chan struct{}, 1),
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	c.retransmissionQueue = newRetransmissionQueue(c)
-
-	c.congestionController = congestion.NewCubicSender(
-		congestion.DefaultClock{},
-		c.rttStats,
-		protocol.InitialPacketSize,
-		true, // Use Reno
-		nil,
-	)
-
+	c.congestionController = congestion.NewCubicSender(congestion.DefaultClock{}, c.rttStats, protocol.InitialPacketSize, true, nil)
 	c.connFlowController = flowcontrol.NewConnectionFlowController(
-		protocol.DefaultInitialMaxData,
-		protocol.DefaultMaxReceiveConnectionFlowControlWindow,
-		func(protocol.ByteCount) bool { return true }, // No-op window update function
-		c.rttStats,
-		c.logger,
+		protocol.DefaultInitialMaxData, protocol.DefaultMaxReceiveConnectionFlowControlWindow,
+		func(protocol.ByteCount) bool { return true }, c.rttStats, c.logger,
 	)
-
 	if isClient {
 		c.nextStreamID = 0
 	} else {
 		c.nextStreamID = 1
 	}
-
-	sentPacketHandler, receivedPacketHandler := ackhandler.NewAckHandler(
-		0,
-		protocol.InitialPacketSize,
-		c.rttStats,
-		!isClient,
-		false,
-		perspective,
-		nil,
-		c.logger,
-	)
+	sentPacketHandler, receivedPacketHandler := ackhandler.NewAckHandler(0, protocol.InitialPacketSize, c.rttStats, !isClient, false, perspective, nil, c.logger)
 	c.sentPacketHandler = sentPacketHandler
 	c.receivedPacketHandler = receivedPacketHandler
-
 	return c, nil
 }
 
-// Run starts the connection's main send and receive loops. It blocks until the context is done.
 func (c *Connection) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	errChan := make(chan error, 2)
-
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
@@ -175,7 +134,6 @@ func (c *Connection) Run(ctx context.Context) error {
 			errChan <- err
 		}
 	}()
-
 	select {
 	case err := <-errChan:
 		c.Close(err)
@@ -190,100 +148,81 @@ func (c *Connection) Run(ctx context.Context) error {
 	}
 }
 
-// receiveLoop continuously reads from the transport and processes incoming packets.
 func (c *Connection) receiveLoop(ctx context.Context) error {
+	frameParser := wire.NewFrameParser(true, true)
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
 		data, err := c.transport.ReadPacket()
 		if err != nil {
 			return err
 		}
-
-		const ackEliciting = true
-		var encLevel protocol.EncryptionLevel
-
+		var (
+			payload                        []byte
+			encLevel                       protocol.EncryptionLevel
+			handshakeCompletedInThisPacket bool
+		)
 		if wire.IsLongHeaderPacket(data[0]) {
 			hdr, packetData, _, err := wire.ParsePacket(data)
 			if err != nil {
-				log.Printf("[RECV] Failed to parse long header packet: %v", err)
 				continue
 			}
 			extHdr, err := hdr.ParseExtended(data)
 			if err != nil {
-				log.Printf("[RECV] Failed to parse extended header: %v", err)
 				continue
 			}
-			payload, err := c.longHeaderOpener.Open(nil, packetData[extHdr.ParsedLen():], extHdr.PacketNumber, packetData[:extHdr.ParsedLen()])
+			payload, err = c.longHeaderOpener.Open(nil, packetData[extHdr.ParsedLen():], extHdr.PacketNumber, packetData[:extHdr.ParsedLen()])
 			if err != nil {
-				log.Printf("[RECV] Failed to 'decrypt' long header packet: %v", err)
 				continue
 			}
 			encLevel = protocol.EncryptionInitial
-
-			// ** THIS IS THE CRITICAL FIX **
-			// If the client receives any valid Initial packet from the server,
-			// it confirms the handshake from its perspective.
 			c.ackMu.Lock()
 			if c.isClient && !c.handshakeComplete {
+				handshakeCompletedInThisPacket = true
 				c.handshakeComplete = true
 				if c.handshakeTimer != nil {
 					c.handshakeTimer.Stop()
-					log.Println("[TIMER] Handshake timer stopped.")
 				}
 				close(c.handshakeCompleteChan)
 			}
+			c.receivedPacketHandler.ReceivedPacket(extHdr.PacketNumber, protocol.ECNUnsupported, encLevel, time.Now(), true)
 			c.ackMu.Unlock()
-			// ** END OF FIX **
-
-			c.ackMu.Lock()
-			c.receivedPacketHandler.ReceivedPacket(extHdr.PacketNumber, protocol.ECNUnsupported, encLevel, time.Now(), ackEliciting)
-			c.ackMu.Unlock()
-			c.handleFrames(payload, encLevel)
-		} else {
-			// This logic is still correct for when 1-RTT traffic starts.
-			c.ackMu.Lock()
-			if c.isClient && !c.handshakeComplete {
-				c.handshakeComplete = true
-				if c.handshakeTimer != nil {
-					c.handshakeTimer.Stop()
-					log.Println("[TIMER] Handshake timer stopped.")
-				}
-				close(c.handshakeCompleteChan)
-			}
-			c.ackMu.Unlock()
-
+		} else { // Short Header Packet
 			_, pn, pnLen, kp, err := wire.ParseShortHeader(data, c.destConnID.Len())
 			if err != nil {
-				log.Printf("[RECV] Failed to parse short header: %v", err)
 				continue
 			}
 			hdrLen := 1 + c.destConnID.Len() + int(pnLen)
-			payload, err := c.shortHeaderOpener.Open(nil, data[hdrLen:], time.Now(), pn, kp, data[:hdrLen])
+			payload, err = c.shortHeaderOpener.Open(nil, data[hdrLen:], time.Now(), pn, kp, data[:hdrLen])
 			if err != nil {
-				log.Printf("[RECV] Failed to 'decrypt' short header packet: %v", err)
 				continue
 			}
 			encLevel = protocol.Encryption1RTT
 			c.ackMu.Lock()
-			c.receivedPacketHandler.ReceivedPacket(pn, protocol.ECNUnsupported, encLevel, time.Now(), ackEliciting)
+			if !c.isClient && !c.initialKeysDropped {
+				c.sentPacketHandler.DropPackets(protocol.EncryptionInitial, time.Now())
+				c.receivedPacketHandler.DropPackets(protocol.EncryptionInitial)
+				c.initialKeysDropped = true
+				log.Printf("[%s] Received first 1-RTT packet. Dropping Initial packet space.", c.side())
+			}
+			c.receivedPacketHandler.ReceivedPacket(pn, protocol.ECNUnsupported, encLevel, time.Now(), true)
 			c.ackMu.Unlock()
-			c.handleFrames(payload, encLevel)
+		}
+		c.processFrames(frameParser, payload, encLevel)
+		if handshakeCompletedInThisPacket {
+			c.ackMu.Lock()
+			c.sentPacketHandler.DropPackets(protocol.EncryptionInitial, time.Now())
+			c.receivedPacketHandler.DropPackets(protocol.EncryptionInitial)
+			c.initialKeysDropped = true
+			log.Printf("[%s] Client confirmed handshake, dropping Initial packet space.", c.side())
+			c.ackMu.Unlock()
 		}
 	}
 }
 
-func (c *Connection) handleFrames(payload []byte, encLevel protocol.EncryptionLevel) {
-	frameParser := wire.NewFrameParser(true, true)
+func (c *Connection) processFrames(frameParser *wire.FrameParser, payload []byte, encLevel protocol.EncryptionLevel) {
 	frameData := payload
 	for len(frameData) > 0 {
 		bytesRead, frame, err := frameParser.ParseNext(frameData, encLevel, protocol.Version1)
 		if err != nil {
-			log.Printf("[RECV] Failed to parse frame: %v", err)
 			break
 		}
 		if frame == nil {
@@ -300,94 +239,83 @@ func (c *Connection) handleFrame(frame wire.Frame, encLevel protocol.EncryptionL
 		c.streamsMu.RLock()
 		stream, ok := c.streams[f.StreamID]
 		c.streamsMu.RUnlock()
-
 		if !ok {
 			stream = c.newStream(f.StreamID)
 			c.streamsMu.Lock()
 			c.streams[f.StreamID] = stream
 			c.streamsMu.Unlock()
-			stream.handleStreamFrame(f)
+			go stream.handleStreamFrame(f)
 			select {
 			case c.acceptQueue <- stream:
 			default:
-				log.Printf("Accept queue full, dropping stream %d", f.StreamID)
+				log.Printf("[%s] Accept queue full, dropping stream %d", c.side(), f.StreamID)
 			}
 		} else {
-			stream.handleStreamFrame(f)
+			go stream.handleStreamFrame(f)
 		}
-
 	case *wire.AckFrame:
 		c.ackMu.Lock()
-		log.Printf("[RECV] Got ACK frame for %s level, acknowledging ranges: %v", encLevel, f.AckRanges)
 		if _, err := c.sentPacketHandler.ReceivedAck(f, encLevel, time.Now()); err != nil {
-			log.Printf("Error processing ACK frame: %v", err)
+			log.Printf("[%s] Error processing ACK frame: %v", c.side(), err)
 		}
 		c.ackMu.Unlock()
-
 	case *wire.PingFrame:
 		c.ackMu.Lock()
-		log.Printf("[RECV] Got PING frame.")
 		if !c.isClient && !c.handshakeComplete {
 			c.handshakeComplete = true
+			log.Printf("[%s] Server handshake complete.", c.side())
 			close(c.handshakeCompleteChan)
 		}
 		c.ackMu.Unlock()
-
 	default:
-		log.Printf("[RECV] Ignoring frame of type %T", f)
+		log.Printf("[%s] Ignoring frame of type %T", c.side(), f)
 	}
 }
 
 func (c *Connection) sendLoop(ctx context.Context) error {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
-
-	// This is set to a non-nil channel only once the timer is started.
 	var handshakeTimerChan <-chan time.Time
-
 	for {
-		// Lazily get the timer channel.
-		// It will be nil until the timer is created in packAndSendPacket.
 		c.ackMu.Lock()
 		if c.handshakeTimer != nil {
 			handshakeTimerChan = c.handshakeTimer.C
 		}
 		c.ackMu.Unlock()
-
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-c.sendingScheduled:
+			if err := c.sendPackets(); err != nil {
+				return err
+			}
 		case <-ticker.C:
-		case <-handshakeTimerChan:
 			c.ackMu.Lock()
-			// Check if the handshake is still not complete.
-			if !c.handshakeComplete {
-				log.Println("[TEST] Handshake timeout, resending PING...")
-				c.sendQueue <- &wire.PingFrame{}
-				c.handshakeTimer.Reset(c.handshakeTimeout)
+			if err := c.sentPacketHandler.OnLossDetectionTimeout(time.Now()); err != nil {
+				c.ackMu.Unlock()
+				return err
 			}
 			c.ackMu.Unlock()
-		}
-
-		if err := c.sendPackets(); err != nil {
-			return err
+			if err := c.sendPackets(); err != nil {
+				return err
+			}
+		case <-handshakeTimerChan:
+			c.ackMu.Lock()
+			if !c.handshakeComplete {
+				log.Printf("[%s] Handshake timeout, resending PING...", c.side())
+				c.sendQueue <- &wire.PingFrame{}
+				c.handshakeTimer.Reset(c.handshakeTimeout)
+				c.scheduleSending()
+			}
+			c.ackMu.Unlock()
 		}
 	}
 }
 
 func (c *Connection) sendPackets() error {
+	var initialFrames, oneRTTFrames []wire.Frame
 	c.ackMu.Lock()
-	if err := c.sentPacketHandler.OnLossDetectionTimeout(time.Now()); err != nil {
-		log.Printf("Loss detection error: %v", err)
-	}
 	isHandshakeComplete := c.handshakeComplete
-	c.ackMu.Unlock()
-
-	var initialFrames []wire.Frame
-	var oneRTTFrames []wire.Frame
-
-	// Priority 1: ACKs
-	c.ackMu.Lock()
 	if ack := c.receivedPacketHandler.GetAckFrame(protocol.EncryptionInitial, time.Now(), false); ack != nil {
 		initialFrames = append(initialFrames, ack)
 	}
@@ -395,38 +323,26 @@ func (c *Connection) sendPackets() error {
 		oneRTTFrames = append(oneRTTFrames, ack)
 	}
 	c.ackMu.Unlock()
-
-	// Priority 2: Retransmissions
 	for c.retransmissionQueue.HasData() {
-		// A full implementation would sort retransmissions by level.
-		// For now, we assume they are 1-RTT for simplicity.
 		oneRTTFrames = append(oneRTTFrames, c.retransmissionQueue.GetFrame())
 	}
-
-	// Priority 3: New Data from the sendQueue
 DrainNewData:
 	for {
 		select {
 		case frame := <-c.sendQueue:
 			if !isHandshakeComplete {
-				// Before the handshake is complete, we only expect PING frames for the handshake.
-				// These must go into an Initial packet.
 				if _, ok := frame.(*wire.PingFrame); ok {
 					initialFrames = append(initialFrames, frame)
 				} else {
-					// Any other frame (like an early STREAM frame) is considered 1-RTT data.
 					oneRTTFrames = append(oneRTTFrames, frame)
 				}
 			} else {
-				// After the handshake, all new frames go into 1-RTT packets.
 				oneRTTFrames = append(oneRTTFrames, frame)
 			}
 		default:
 			break DrainNewData
 		}
 	}
-
-	// Pack and send Initial packets if we have any frames for them.
 	if len(initialFrames) > 0 {
 		for len(initialFrames) > 0 {
 			var err error
@@ -436,8 +352,6 @@ DrainNewData:
 			}
 		}
 	}
-
-	// Pack and send 1-RTT packets if we have any frames for them.
 	if len(oneRTTFrames) > 0 {
 		for len(oneRTTFrames) > 0 {
 			var err error
@@ -450,12 +364,13 @@ DrainNewData:
 	return nil
 }
 
-func (c *Connection) packAndSendPacket(frames []wire.Frame, encLevel protocol.EncryptionLevel) (remainingFrames []wire.Frame, err error) {
-	var pn protocol.PacketNumber
-	var pnLen protocol.PacketNumberLen
-
+func (c *Connection) packAndSendPacket(frames []wire.Frame, encLevel protocol.EncryptionLevel) ([]wire.Frame, error) {
 	c.ackMu.Lock()
-	pn, pnLen = c.sentPacketHandler.PeekPacketNumber(encLevel)
+	if encLevel == protocol.EncryptionInitial && c.initialKeysDropped {
+		c.ackMu.Unlock()
+		return nil, nil // Discard frames that can't be sent.
+	}
+	pn, pnLen := c.sentPacketHandler.PeekPacketNumber(encLevel)
 	c.sentPacketHandler.PopPacketNumber(encLevel)
 	c.ackMu.Unlock()
 
@@ -463,10 +378,8 @@ func (c *Connection) packAndSendPacket(frames []wire.Frame, encLevel protocol.En
 	var framesInPacket []wire.Frame
 	var ackFramesInPacket []ackhandler.Frame
 	var cutoff int
-
-	maxPacketSize := protocol.InitialPacketSize - 40 // A conservative value for overhead
+	maxPacketSize := protocol.InitialPacketSize - 40
 	handler := c.retransmissionQueue.FrameHandler(encLevel)
-
 	for i, frame := range frames {
 		frameLen := int(frame.Length(protocol.Version1))
 		if payloadLength+frameLen > maxPacketSize && payloadLength > 0 {
@@ -477,14 +390,9 @@ func (c *Connection) packAndSendPacket(frames []wire.Frame, encLevel protocol.En
 		ackFramesInPacket = append(ackFramesInPacket, ackhandler.Frame{Frame: frame, Handler: handler})
 		cutoff = i + 1
 	}
-
 	if len(framesInPacket) == 0 {
-		if cutoff < len(frames) {
-			return frames[cutoff:], nil
-		}
-		return nil, nil
+		return frames[cutoff:], nil
 	}
-
 	payloadBuf := getPacketBuffer()
 	defer putPacketBuffer(payloadBuf)
 	for _, frame := range framesInPacket {
@@ -495,32 +403,26 @@ func (c *Connection) packAndSendPacket(frames []wire.Frame, encLevel protocol.En
 		payloadBuf.Reset()
 		payloadBuf.Write(b)
 	}
-
-	var raw []byte
-	var payload []byte
+	var raw, payload []byte
 	var overhead int
-
+	var err error
 	if encLevel == protocol.EncryptionInitial {
 		overhead = c.longHeaderSealer.Overhead()
 		hdr := &wire.ExtendedHeader{
 			Header: wire.Header{
-				Type:             protocol.PacketTypeInitial,
-				DestConnectionID: c.destConnID,
-				SrcConnectionID:  c.destConnID,
-				Length:           protocol.ByteCount(payloadBuf.Len() + int(pnLen) + overhead),
-				Version:          protocol.Version1,
+				Type: protocol.PacketTypeInitial, DestConnectionID: c.destConnID, SrcConnectionID: c.destConnID,
+				Length:  protocol.ByteCount(payloadBuf.Len() + int(pnLen) + overhead),
+				Version: protocol.Version1,
 			},
-			PacketNumber:    pn,
-			PacketNumberLen: pnLen,
+			PacketNumber: pn, PacketNumberLen: pnLen,
 		}
 		raw, err = hdr.Append(nil, protocol.Version1)
 		payload = c.longHeaderSealer.Seal(nil, payloadBuf.Bytes(), pn, raw)
-
 		c.ackMu.Lock()
 		if c.isClient && !c.initialPacketSent {
 			c.initialPacketSent = true
 			c.handshakeTimer = time.NewTimer(c.handshakeTimeout)
-			log.Println("[TIMER] Handshake timer started.")
+			log.Printf("[%s] Initial packet sent. Handshake timer started.", c.side())
 		}
 		c.ackMu.Unlock()
 	} else {
@@ -528,47 +430,43 @@ func (c *Connection) packAndSendPacket(frames []wire.Frame, encLevel protocol.En
 		raw, err = wire.AppendShortHeader(nil, c.destConnID, pn, pnLen, c.shortHeaderSealer.KeyPhase())
 		payload = c.shortHeaderSealer.Seal(nil, payloadBuf.Bytes(), pn, raw)
 	}
-
 	if err != nil {
 		return nil, err
 	}
-
 	c.ackMu.Lock()
-	var streamFrames []ackhandler.StreamFrame
 	c.sentPacketHandler.SentPacket(
-		time.Now(), pn, protocol.InvalidPacketNumber, streamFrames, ackFramesInPacket,
+		time.Now(), pn, protocol.InvalidPacketNumber, nil, ackFramesInPacket,
 		encLevel, protocol.ECNUnsupported, protocol.ByteCount(payloadBuf.Len()+len(raw)+overhead),
-		true, // isAckEliciting
-		false,
+		false, false,
 	)
 	c.ackMu.Unlock()
-
 	raw = append(raw, payload...)
-	err = c.transport.WritePacket(raw)
-	if err != nil {
+	if err := c.transport.WritePacket(raw); err != nil {
 		return nil, err
 	}
-
-	if cutoff < len(frames) {
-		return frames[cutoff:], nil
-	}
-	return nil, nil
+	return frames[cutoff:], nil
 }
 
-// OpenStream creates a new stream for the application to use.
+func (c *Connection) newStream(id protocol.StreamID) *Stream {
+	fc := flowcontrol.NewStreamFlowController(
+		id, c.connFlowController,
+		protocol.DefaultInitialMaxStreamData, protocol.DefaultMaxReceiveConnectionFlowControlWindow,
+		protocol.ByteCount(protocol.DefaultInitialMaxStreamData),
+		c.rttStats, c.logger,
+	)
+	return newStream(c.ctx, id, c, fc)
+}
+
 func (c *Connection) OpenStream(ctx context.Context) (*Stream, error) {
 	c.streamsMu.Lock()
 	defer c.streamsMu.Unlock()
-
 	streamID := c.nextStreamID
 	c.nextStreamID += 2
-
 	stream := c.newStream(streamID)
 	c.streams[streamID] = stream
 	return stream, nil
 }
 
-// AcceptStream waits for and returns the next stream initiated by the peer.
 func (c *Connection) AcceptStream(ctx context.Context) (*Stream, error) {
 	select {
 	case <-ctx.Done():
@@ -580,35 +478,20 @@ func (c *Connection) AcceptStream(ctx context.Context) (*Stream, error) {
 	}
 }
 
-// newStream is an internal helper to create and register a new stream.
-func (c *Connection) newStream(id protocol.StreamID) *Stream {
-	fc := flowcontrol.NewStreamFlowController(
-		id,
-		c.connFlowController,
-		protocol.DefaultInitialMaxStreamData,
-		protocol.DefaultMaxReceiveConnectionFlowControlWindow,
-		protocol.ByteCount(protocol.DefaultInitialMaxStreamData),
-		c.rttStats,
-		c.logger,
-	)
-
-	stream := newStream(c.ctx, id, c, fc)
-	return stream
-}
-
-// sendStreamData is called by a Stream to queue its data for sending.
-func (c *Connection) sendStreamData(id protocol.StreamID, data []byte, fin bool, offset protocol.ByteCount) {
-	frame := &wire.StreamFrame{
-		StreamID:       id,
-		Offset:         offset,
-		Data:           data,
-		Fin:            fin,
-		DataLenPresent: true,
+func (c *Connection) scheduleSending() {
+	select {
+	case c.sendingScheduled <- struct{}{}:
+	default:
 	}
-	c.sendQueue <- frame
 }
 
-// Close shuts down the connection.
+func (c *Connection) sendStreamData(id protocol.StreamID, data []byte, fin bool, offset protocol.ByteCount) {
+	c.sendQueue <- &wire.StreamFrame{
+		StreamID: id, Offset: offset, Data: data, Fin: fin, DataLenPresent: true,
+	}
+	c.scheduleSending()
+}
+
 func (c *Connection) Close(err error) {
 	c.cancel()
 	c.transport.Close()
@@ -619,16 +502,16 @@ func (c *Connection) Close(err error) {
 	}
 }
 
-var packetBufferPool = sync.Pool{
-	New: func() any {
-		return new(bytes.Buffer)
-	},
+func (c *Connection) side() string {
+	if c.isClient {
+		return "CLIENT"
+	}
+	return "SERVER"
 }
 
-func getPacketBuffer() *bytes.Buffer {
-	return packetBufferPool.Get().(*bytes.Buffer)
-}
+var packetBufferPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 
+func getPacketBuffer() *bytes.Buffer { return packetBufferPool.Get().(*bytes.Buffer) }
 func putPacketBuffer(buf *bytes.Buffer) {
 	buf.Reset()
 	packetBufferPool.Put(buf)
