@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"io"
+	"net"
 	"sync"
 )
 
@@ -59,21 +60,37 @@ func newInMemoryTransportPair() (LowerLayerTransport, LowerLayerTransport) {
 	return client, server
 }
 
+// WritePacket is the legacy write method.
 func (t *inMemoryTransport) WritePacket(pkt []byte) error {
+	return t.Write(pkt)
+}
+
+// Write implements the sendConn interface for the new sendQueue.
+func (t *inMemoryTransport) Write(p []byte) error {
 	select {
 	case <-t.closer.closed:
 		return errors.New("transport closed")
 	default:
 	}
 	// Make a copy to prevent race conditions if the sender reuses the buffer.
-	pktCopy := make([]byte, len(pkt))
-	copy(pktCopy, pkt)
+	pktCopy := make([]byte, len(p))
+	copy(pktCopy, p)
 	select {
 	case <-t.closer.closed:
 		return errors.New("transport closed")
 	case t.writeChan <- pktCopy:
 		return nil
 	}
+}
+
+// WriteTo implements the sendConn interface for sending probe packets.
+// For the in-memory transport, we don't need a real address.
+func (t *inMemoryTransport) WriteTo(p []byte, addr net.Addr) (int, error) {
+	err := t.Write(p)
+	if err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
 
 func (t *inMemoryTransport) ReadPacket() ([]byte, error) {

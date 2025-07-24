@@ -11,6 +11,7 @@ import (
 	"github.com/dozyio/quic-buffer-go/internal/wire"
 )
 
+// Stream struct remains the same.
 type Stream struct {
 	id          protocol.StreamID
 	conn        *Connection
@@ -111,11 +112,14 @@ func (s *Stream) handleStreamFrame(f *wire.StreamFrame) {
 	}
 }
 
+// Write now sends data in chunks via the connection's sendStreamData method.
 func (s *Stream) Write(p []byte) (n int, err error) {
 	totalLen := len(p)
 	bytesSent := 0
 	for bytesSent < totalLen {
-		const maxFrameDataSize = 1200
+		// This value must be smaller than MaxPacketBufferSize minus overheads.
+		// 1000 is a safe value.
+		const maxFrameDataSize = 1000
 		end := bytesSent + maxFrameDataSize
 		if end > totalLen {
 			end = totalLen
@@ -128,6 +132,7 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 	return totalLen, nil
 }
 
+// Close sends a FIN frame.
 func (s *Stream) Close() error {
 	s.conn.sendStreamData(s.id, nil, true, s.writeOffset)
 	return nil
