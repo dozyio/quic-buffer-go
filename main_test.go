@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"io"
 	"log"
 	mrand "math/rand"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -213,6 +215,122 @@ func (t *adverseTransport) Close() error {
 	}
 	t.reorderBuffer = nil
 	return t.underlying.Close()
+}
+
+// udpTransport is a transport layer that uses a real UDP socket.
+type udpTransport struct {
+	conn       *net.UDPConn
+	remoteAddr net.Addr
+	mu         sync.Mutex
+}
+
+// newUDPTransport creates a new transport listening on a random UDP port.
+func newUDPTransport(t testing.TB) *udpTransport {
+	addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	conn, err := net.ListenUDP("udp", addr)
+	require.NoError(t, err)
+	return &udpTransport{conn: conn}
+}
+
+func (t *udpTransport) WritePacket(p []byte) error {
+	t.mu.Lock()
+	remote := t.remoteAddr
+	t.mu.Unlock()
+	if remote == nil {
+		return errors.New("udp transport: remote address not set")
+	}
+	_, err := t.conn.WriteTo(p, remote)
+	return err
+}
+
+func (t *udpTransport) ReadPacket() ([]byte, error) {
+	buf := make([]byte, 2048) // A buffer large enough for typical MTU
+	n, remote, err := t.conn.ReadFrom(buf)
+	if err != nil {
+		return nil, err
+	}
+
+	t.mu.Lock()
+	if t.remoteAddr == nil {
+		// Learn the remote address from the first packet we receive
+		t.remoteAddr = remote
+	}
+	t.mu.Unlock()
+	return buf[:n], nil
+}
+
+func (t *udpTransport) Close() error {
+	return t.conn.Close()
+}
+
+// LocalAddr returns the local network address.
+func (t *udpTransport) LocalAddr() net.Addr {
+	return t.conn.LocalAddr()
+}
+
+// SetRemoteAddr sets the destination address for outgoing packets.
+func (t *udpTransport) SetRemoteAddr(addr net.Addr) {
+	t.mu.Lock()
+	t.remoteAddr = addr
+	t.mu.Unlock()
+}
+
+var tcpBufferPool = sync.Pool{
+	New: func() any {
+		// Allocate a buffer large enough for a length prefix plus a typical MTU.
+		return make([]byte, 4+2048)
+	},
+}
+
+// tcpTransport is a transport that runs over a reliable, stream-based connection (like TCP).
+// It frames packets by prefixing each one with its length.
+type tcpTransport struct {
+	conn net.Conn
+	mu   sync.Mutex
+}
+
+func newTCPTransport(conn net.Conn) LowerLayerTransport {
+	return &tcpTransport{conn: conn}
+}
+
+func (t *tcpTransport) WritePacket(p []byte) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Get a buffer from the pool.
+	buf := tcpBufferPool.Get().([]byte)
+	defer tcpBufferPool.Put(buf) // Ensure the buffer is returned to the pool.
+
+	// Write the 4-byte length prefix.
+	binary.BigEndian.PutUint32(buf, uint32(len(p)))
+	// Copy the packet data right after the length prefix.
+	copy(buf[4:], p)
+
+	// Write the combined buffer (prefix + packet) in a single system call.
+	_, err := t.conn.Write(buf[:4+len(p)])
+	return err
+}
+
+func (t *tcpTransport) ReadPacket() ([]byte, error) {
+	lenBuf := make([]byte, 4)
+	// Read the 4-byte length prefix.
+	if _, err := io.ReadFull(t.conn, lenBuf); err != nil {
+		return nil, err
+	}
+
+	length := binary.BigEndian.Uint32(lenBuf)
+
+	// Read the full packet based on the length prefix.
+	packetBuf := make([]byte, length)
+	if _, err := io.ReadFull(t.conn, packetBuf); err != nil {
+		return nil, err
+	}
+	return packetBuf, nil
+}
+
+func (t *tcpTransport) Close() error {
+	return t.conn.Close()
 }
 
 // pacedReader simulates a real-world data source by introducing a small delay.
@@ -798,4 +916,166 @@ func TestIdleTimeoutWithNetworkFailure(t *testing.T) {
 	require.Error(t, clientErr, "Client should have returned an error")
 	require.Contains(t, clientErr.Error(), "idle timeout", "Client error should be due to idle timeout")
 	log.Printf("[SUCCESS] Client correctly closed connection due to idle timeout.")
+}
+
+func TestBulkTransferUDP(t *testing.T) {
+	// This test uses real UDP sockets on the loopback interface.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// Set up two UDP transports on random ports
+	serverTransport := newUDPTransport(t)
+	clientTransport := newUDPTransport(t)
+
+	// Tell the client where the server is
+	clientTransport.SetRemoteAddr(serverTransport.LocalAddr())
+
+	client, err := NewConnection(clientTransport, true)
+	require.NoError(t, err)
+	server, err := NewConnection(serverTransport, false)
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); runConnection(t, ctx, client) }()
+	go func() { defer wg.Done(); runConnection(t, ctx, server) }()
+
+	// Handshake
+	client.sendQueue <- &wire.PingFrame{}
+	<-client.handshakeCompleteChan
+	<-server.handshakeCompleteChan
+
+	const dataSize = 10 * 1024 * 1024 // 10 MB
+	clientData := make([]byte, dataSize)
+	_, err = rand.Read(clientData)
+	require.NoError(t, err)
+
+	var serverReceivedData []byte
+	var transferWg sync.WaitGroup
+	transferWg.Add(1)
+
+	startTime := time.Now()
+
+	go func() {
+		defer transferWg.Done()
+		stream, err := server.AcceptStream(ctx)
+		require.NoError(t, err)
+		serverReceivedData, err = io.ReadAll(stream)
+		require.NoError(t, err)
+	}()
+
+	go func() {
+		stream, err := client.OpenStream(ctx)
+		require.NoError(t, err)
+		_, err = stream.Write(clientData)
+		require.NoError(t, err)
+		require.NoError(t, stream.Close())
+	}()
+
+	transferWg.Wait()
+
+	duration := time.Since(startTime)
+	mbps := (float64(dataSize) / (1024 * 1024)) / duration.Seconds()
+	log.Printf("[SUCCESS] UDP Bulk transfer confirmed.")
+	log.Printf("[STATS] Transferred %d bytes in %v.", dataSize, duration)
+	log.Printf("[STATS] Speed: %.2f MB/s", mbps)
+
+	require.Equal(t, len(clientData), len(serverReceivedData))
+	require.True(t, bytes.Equal(clientData, serverReceivedData))
+
+	client.Close(nil)
+	server.Close(nil)
+	wg.Wait()
+}
+
+func TestBulkTransferOverTCP(t *testing.T) {
+	// This test runs the QUIC buffer implementation over a reliable TCP stream.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer listener.Close()
+
+	const dataSize = 10 * 1024 * 1024 // 10 MB
+	clientData := make([]byte, dataSize)
+	_, err = rand.Read(clientData)
+	require.NoError(t, err)
+
+	var serverReceivedData []byte
+	var wg sync.WaitGroup
+	errChan := make(chan error, 2)
+
+	wg.Add(1)
+	// Server Goroutine
+	go func() {
+		defer wg.Done()
+		tcpConn, err := listener.Accept()
+		if err != nil {
+			if !errors.Is(err, net.ErrClosed) {
+				errChan <- err
+			}
+			return
+		}
+		serverTransport := newTCPTransport(tcpConn)
+		server, err := NewConnection(serverTransport, false)
+		if err != nil {
+			errChan <- err
+			return
+		}
+		go server.Run(ctx)
+		stream, err := server.AcceptStream(ctx)
+		if err != nil {
+			errChan <- err
+			return
+		}
+		serverReceivedData, err = io.ReadAll(stream)
+		if err != nil {
+			errChan <- err
+		}
+	}()
+
+	// Client Goroutine
+	tcpConn, err := net.Dial("tcp", listener.Addr().String())
+	require.NoError(t, err)
+
+	clientTransport := newTCPTransport(tcpConn)
+	client, err := NewConnection(clientTransport, true)
+	require.NoError(t, err)
+
+	go client.Run(ctx)
+
+	// --- Start timing before the transfer ---
+	startTime := time.Now()
+
+	client.sendQueue <- &wire.PingFrame{}
+	<-client.handshakeCompleteChan
+
+	stream, err := client.OpenStream(ctx)
+	require.NoError(t, err)
+
+	_, err = stream.Write(clientData)
+	require.NoError(t, err)
+
+	err = stream.Close()
+	require.NoError(t, err)
+
+	// Wait for the server to finish reading the data
+	wg.Wait()
+	close(errChan)
+
+	// --- Stop timing and calculate speed ---
+	duration := time.Since(startTime)
+	mbps := (float64(dataSize) / (1024 * 1024)) / duration.Seconds()
+
+	for err := range errChan {
+		require.NoError(t, err)
+	}
+
+	// Final verification and logging
+	require.Equal(t, len(clientData), len(serverReceivedData))
+	require.True(t, bytes.Equal(clientData, serverReceivedData))
+	log.Printf("[SUCCESS] QUIC-over-TCP Bulk transfer confirmed.")
+	log.Printf("[STATS] Transferred %d bytes in %v.", dataSize, duration)
+	log.Printf("[STATS] QUIC-over-TCP Speed: %.2f MB/s", mbps)
 }
