@@ -41,35 +41,39 @@ func (l *dummyLogger) SetLogLevel(level utils.LogLevel)      {}
 func (l *dummyLogger) SetLogTimeFormat(format string)        {}
 
 type Connection struct {
-	transport             LowerLayerTransport
-	isClient              bool
-	ctx                   context.Context
-	cancel                context.CancelFunc
-	destConnID            protocol.ConnectionID
-	nextStreamID          protocol.StreamID
-	streams               map[protocol.StreamID]*Stream
-	streamsMu             sync.RWMutex
-	acceptQueue           chan *Stream
-	sentPacketHandler     ackhandler.SentPacketHandler
-	receivedPacketHandler ackhandler.ReceivedPacketHandler
-	ackMu                 sync.Mutex
-	congestionController  congestion.SendAlgorithmWithDebugInfos
-	connFlowController    flowcontrol.ConnectionFlowController
-	rttStats              *utils.RTTStats
-	longHeaderSealer      handshake.LongHeaderSealer
-	longHeaderOpener      handshake.LongHeaderOpener
-	shortHeaderSealer     handshake.ShortHeaderSealer
-	shortHeaderOpener     handshake.ShortHeaderOpener
-	sendQueue             chan wire.Frame
-	retransmissionQueue   *retransmissionQueue
-	logger                utils.Logger
-	handshakeComplete     bool
-	handshakeCompleteChan chan struct{}
-	handshakeTimer        *time.Timer
-	handshakeTimeout      time.Duration
-	initialKeysDropped    bool
-	sendingScheduled      chan struct{}
-	initialPacketSent     bool
+	transport              LowerLayerTransport
+	isClient               bool
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	destConnID             protocol.ConnectionID
+	nextStreamID           protocol.StreamID
+	streams                map[protocol.StreamID]*Stream
+	streamsMu              sync.RWMutex
+	acceptQueue            chan *Stream
+	sentPacketHandler      ackhandler.SentPacketHandler
+	receivedPacketHandler  ackhandler.ReceivedPacketHandler
+	ackMu                  sync.Mutex
+	congestionController   congestion.SendAlgorithmWithDebugInfos
+	connFlowController     flowcontrol.ConnectionFlowController
+	rttStats               *utils.RTTStats
+	longHeaderSealer       handshake.LongHeaderSealer
+	longHeaderOpener       handshake.LongHeaderOpener
+	shortHeaderSealer      handshake.ShortHeaderSealer
+	shortHeaderOpener      handshake.ShortHeaderOpener
+	sendQueue              chan wire.Frame
+	retransmissionQueue    *retransmissionQueue
+	logger                 utils.Logger
+	handshakeComplete      bool
+	handshakeCompleteChan  chan struct{}
+	handshakeTimer         *time.Timer
+	handshakeTimeout       time.Duration
+	initialKeysDropped     bool
+	sendingScheduled       chan struct{}
+	initialPacketSent      bool
+	idleTimeout            time.Duration
+	keepAliveInterval      time.Duration
+	lastPacketReceivedTime time.Time
+	keepAlivePingSent      bool
 }
 
 func NewConnection(transport LowerLayerTransport, isClient bool) (*Connection, error) {
@@ -85,21 +89,24 @@ func NewConnection(transport LowerLayerTransport, isClient bool) (*Connection, e
 		perspective = protocol.PerspectiveServer
 	}
 	c := &Connection{
-		transport:             transport,
-		isClient:              isClient,
-		destConnID:            connID,
-		streams:               make(map[protocol.StreamID]*Stream),
-		acceptQueue:           make(chan *Stream, 10),
-		rttStats:              rttStats,
-		longHeaderSealer:      &nullLongHeaderAEAD{},
-		longHeaderOpener:      &nullLongHeaderAEAD{},
-		shortHeaderSealer:     &nullShortHeaderAEAD{},
-		shortHeaderOpener:     &nullShortHeaderAEAD{},
-		sendQueue:             make(chan wire.Frame, 10000),
-		logger:                logger,
-		handshakeCompleteChan: make(chan struct{}),
-		handshakeTimeout:      1 * time.Second,
-		sendingScheduled:      make(chan struct{}, 1),
+		transport:              transport,
+		isClient:               isClient,
+		destConnID:             connID,
+		streams:                make(map[protocol.StreamID]*Stream),
+		acceptQueue:            make(chan *Stream, 10),
+		rttStats:               rttStats,
+		longHeaderSealer:       &nullLongHeaderAEAD{},
+		longHeaderOpener:       &nullLongHeaderAEAD{},
+		shortHeaderSealer:      &nullShortHeaderAEAD{},
+		shortHeaderOpener:      &nullShortHeaderAEAD{},
+		sendQueue:              make(chan wire.Frame, 10000),
+		logger:                 logger,
+		handshakeCompleteChan:  make(chan struct{}),
+		handshakeTimeout:       1 * time.Second,
+		sendingScheduled:       make(chan struct{}, 1),
+		idleTimeout:            DefaultIdleTimeout,
+		keepAliveInterval:      DefaultIdleTimeout / 2,
+		lastPacketReceivedTime: time.Now(),
 	}
 
 	c.ctx, c.cancel = context.WithCancel(context.Background())
@@ -123,38 +130,44 @@ func NewConnection(transport LowerLayerTransport, isClient bool) (*Connection, e
 }
 
 func (c *Connection) Run(ctx context.Context) error {
-	var wg sync.WaitGroup
 	errChan := make(chan error, 2)
 
-	wg.Add(2)
 	go func() {
-		defer wg.Done()
+		// This goroutine runs until the connection's internal c.ctx is canceled.
 		err := c.receiveLoop(c.ctx)
+		// Don't send an error if it's a standard closure.
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
 			errChan <- err
+		} else {
+			errChan <- nil // Signal graceful exit
 		}
 	}()
 
 	go func() {
-		defer wg.Done()
 		err := c.sendLoop(c.ctx)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			errChan <- err
+		} else {
+			errChan <- nil // Signal graceful exit
 		}
 	}()
 
-	select {
-	case err := <-errChan:
-		c.Close(err)
-		return err
-	case <-ctx.Done():
-		c.Close(ctx.Err())
-		wg.Wait()
+	// Wait for the first of the two loops to exit.
+	err := <-errChan
+	// Now that one loop has exited (likely by calling c.Close), the other will exit shortly.
+	// Calling c.Close() ensures a clean shutdown if the exit was triggered by the external context.
+	c.Close(err)
+
+	// Wait for the second loop to finish exiting.
+	<-errChan
+
+	// If the test context was canceled, that's the primary reason for shutdown.
+	if ctx.Err() != nil {
 		return ctx.Err()
-	case <-c.ctx.Done():
-		wg.Wait()
-		return nil
 	}
+
+	// Otherwise, return the actual error from the loop (which could be nil).
+	return err
 }
 
 func (c *Connection) receiveLoop(ctx context.Context) error {
@@ -164,6 +177,11 @@ func (c *Connection) receiveLoop(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+
+		c.ackMu.Lock()
+		c.lastPacketReceivedTime = time.Now()
+		c.keepAlivePingSent = false
+		c.ackMu.Unlock()
 
 		var (
 			payload                        []byte
@@ -305,6 +323,7 @@ func (c *Connection) handleFrame(frame wire.Frame, encLevel protocol.EncryptionL
 func (c *Connection) sendLoop(ctx context.Context) error {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
+
 	var handshakeTimerChan <-chan time.Time
 	for {
 		c.ackMu.Lock()
@@ -325,6 +344,23 @@ func (c *Connection) sendLoop(ctx context.Context) error {
 				c.ackMu.Unlock()
 				return err
 			}
+
+			idleDuration := time.Since(c.lastPacketReceivedTime)
+			if idleDuration > c.idleTimeout {
+				c.ackMu.Unlock()
+				err := errors.New("idle timeout")
+				c.Close(err)
+				return err
+			}
+
+			// Keep-Alive Probe
+			if idleDuration > c.keepAliveInterval && !c.keepAlivePingSent {
+				log.Printf("[%s] Sending keep-alive PING.", c.side())
+				c.sendQueue <- &wire.PingFrame{}
+				c.scheduleSending()
+				c.keepAlivePingSent = true
+			}
+
 			c.ackMu.Unlock()
 			if err := c.sendPackets(); err != nil {
 				return err
@@ -396,13 +432,15 @@ DrainNewData:
 
 func (c *Connection) packAndSendPacket(frames []wire.Frame, encLevel protocol.EncryptionLevel) ([]wire.Frame, error) {
 	c.ackMu.Lock()
+
 	if encLevel == protocol.EncryptionInitial && c.initialKeysDropped {
 		c.ackMu.Unlock()
 		return nil, nil
 	}
+
 	pn, pnLen := c.sentPacketHandler.PeekPacketNumber(encLevel)
 	c.sentPacketHandler.PopPacketNumber(encLevel)
-	c.ackMu.Unlock()
+
 	var payloadLength int
 	var framesInPacket []wire.Frame
 	var ackFramesInPacket []ackhandler.Frame
@@ -410,6 +448,7 @@ func (c *Connection) packAndSendPacket(frames []wire.Frame, encLevel protocol.En
 	isAckEliciting := false
 	maxPacketSize := InitialPacketSize
 	handler := c.retransmissionQueue.FrameHandler(encLevel)
+
 	for i, frame := range frames {
 		if _, isAck := frame.(*wire.AckFrame); !isAck {
 			isAckEliciting = true
@@ -423,56 +462,70 @@ func (c *Connection) packAndSendPacket(frames []wire.Frame, encLevel protocol.En
 		ackFramesInPacket = append(ackFramesInPacket, ackhandler.Frame{Frame: frame, Handler: handler})
 		cutoff = i + 1
 	}
+
 	if len(framesInPacket) == 0 {
+		c.ackMu.Unlock()
 		return frames[cutoff:], nil
 	}
+
 	payloadBuf := getPacketBuffer()
 	defer putPacketBuffer(payloadBuf)
 	for _, frame := range framesInPacket {
 		b, err := frame.Append(payloadBuf.Bytes(), protocol.Version2)
 		if err != nil {
+			c.ackMu.Unlock()
 			return nil, err
 		}
 		payloadBuf.Reset()
 		payloadBuf.Write(b)
 	}
+
 	var raw, payload []byte
 	var overhead int
 	var err error
+
 	if encLevel == protocol.EncryptionInitial {
 		overhead = c.longHeaderSealer.Overhead()
 		hdr := &wire.ExtendedHeader{
 			Header: wire.Header{
-				Type: protocol.PacketTypeInitial, DestConnectionID: c.destConnID, SrcConnectionID: c.destConnID,
-				Length:  protocol.ByteCount(payloadBuf.Len() + int(pnLen) + overhead),
-				Version: protocol.Version2,
+				Type:             protocol.PacketTypeInitial,
+				DestConnectionID: c.destConnID,
+				SrcConnectionID:  c.destConnID,
+				Length:           protocol.ByteCount(payloadBuf.Len() + int(pnLen) + overhead),
+				Version:          protocol.Version2,
 			},
-			PacketNumber: pn, PacketNumberLen: pnLen,
+			PacketNumber:    pn,
+			PacketNumberLen: pnLen,
 		}
 		raw, err = hdr.Append(nil, protocol.Version2)
+		if err != nil {
+			c.ackMu.Unlock()
+			return nil, err
+		}
 		payload = c.longHeaderSealer.Seal(nil, payloadBuf.Bytes(), pn, raw)
-		c.ackMu.Lock()
 		if c.isClient && !c.initialPacketSent {
 			c.initialPacketSent = true
 			c.handshakeTimer = time.NewTimer(c.handshakeTimeout)
 			log.Printf("[%s] Initial packet sent. Handshake timer started.", c.side())
 		}
-		c.ackMu.Unlock()
 	} else {
 		overhead = c.shortHeaderSealer.Overhead()
 		raw, err = wire.AppendShortHeader(nil, c.destConnID, pn, pnLen, c.shortHeaderSealer.KeyPhase())
+		if err != nil {
+			c.ackMu.Unlock()
+			return nil, err
+		}
 		payload = c.shortHeaderSealer.Seal(nil, payloadBuf.Bytes(), pn, raw)
 	}
-	if err != nil {
-		return nil, err
-	}
-	c.ackMu.Lock()
+
 	c.sentPacketHandler.SentPacket(
 		time.Now(), pn, protocol.InvalidPacketNumber, nil, ackFramesInPacket,
 		encLevel, protocol.ECNUnsupported, protocol.ByteCount(payloadBuf.Len()+len(raw)+overhead),
 		isAckEliciting, false,
 	)
-	c.ackMu.Unlock()
+
+	c.ackMu.Unlock() // Unlock before the network write.
+
 	raw = append(raw, payload...)
 	if err := c.transport.WritePacket(raw); err != nil {
 		return nil, err

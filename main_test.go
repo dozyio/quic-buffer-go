@@ -21,7 +21,6 @@ import (
 type mockTransport struct {
 	clientToServer chan []byte
 	serverToClient chan []byte
-	wg             sync.WaitGroup
 	isClosed       bool
 	mu             sync.Mutex
 }
@@ -146,6 +145,12 @@ func (t *adverseTransport) WritePacket(p []byte) error {
 
 	go func() {
 		defer t.wg.Done()
+
+		// Allow handshake
+		if packetNum <= 4 {
+			t.underlying.WritePacket(pCopy)
+			return
+		}
 
 		t.randLock.Lock()
 		delay := t.latency
@@ -581,4 +586,233 @@ func TestExtremeLatencyVariation(t *testing.T) {
 	client.Close(nil)
 	server.Close(nil)
 	wg.Wait()
+}
+
+func runConnection(t testing.TB, ctx context.Context, conn *Connection) {
+	t.Helper()
+	err := conn.Run(ctx)
+	// We expect the context to be canceled or the deadline to be exceeded in a normal test shutdown.
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, io.EOF) {
+		require.NoError(t, err, "connection run loop failed unexpectedly")
+	}
+}
+
+func TestDuplexTransfer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	transport := newMockTransport()
+	client, err := NewConnection(transport, true)
+	require.NoError(t, err)
+	server, err := NewConnection(transport.Inverted(), false)
+	require.NoError(t, err)
+
+	// Run both connections in the background
+	var connWg sync.WaitGroup
+	connWg.Add(2)
+	go func() { defer connWg.Done(); runConnection(t, ctx, client) }()
+	go func() { defer connWg.Done(); runConnection(t, ctx, server) }()
+
+	// Perform handshake
+	client.sendQueue <- &wire.PingFrame{}
+	<-client.handshakeCompleteChan
+	<-server.handshakeCompleteChan
+
+	const dataSize = 10 * 1024 * 1024 // 10 MB
+	var transferWg sync.WaitGroup
+	transferWg.Add(2) // We wait for two transfers to complete
+
+	// --- Transfer 1: Client to Server ---
+	go func() {
+		defer transferWg.Done()
+		// Prepare data
+		clientData := make([]byte, dataSize)
+		_, err := rand.Read(clientData)
+		require.NoError(t, err)
+
+		var receivedData []byte
+		var serverWg sync.WaitGroup
+		serverWg.Add(1)
+
+		// Server accepts and reads
+		go func() {
+			defer serverWg.Done()
+			stream, err := server.AcceptStream(ctx)
+			require.NoError(t, err)
+			receivedData, err = io.ReadAll(stream)
+			require.NoError(t, err)
+		}()
+
+		// Client opens and writes
+		stream, err := client.OpenStream(ctx)
+		require.NoError(t, err)
+		_, err = stream.Write(clientData)
+		require.NoError(t, err)
+		require.NoError(t, stream.Close())
+
+		serverWg.Wait()
+		require.True(t, bytes.Equal(clientData, receivedData), "client-to-server data mismatch")
+	}()
+
+	// --- Transfer 2: Server to Client ---
+	go func() {
+		defer transferWg.Done()
+		// Prepare data
+		serverData := make([]byte, dataSize)
+		_, err := rand.Read(serverData)
+		require.NoError(t, err)
+
+		var receivedData []byte
+		var clientWg sync.WaitGroup
+		clientWg.Add(1)
+
+		// Client accepts and reads
+		go func() {
+			defer clientWg.Done()
+			stream, err := client.AcceptStream(ctx)
+			require.NoError(t, err)
+			receivedData, err = io.ReadAll(stream)
+			require.NoError(t, err)
+		}()
+
+		// Server opens and writes
+		stream, err := server.OpenStream(ctx)
+		require.NoError(t, err)
+		_, err = stream.Write(serverData)
+		require.NoError(t, err)
+		require.NoError(t, stream.Close())
+
+		clientWg.Wait()
+		require.True(t, bytes.Equal(serverData, receivedData), "server-to-client data mismatch")
+	}()
+
+	// Wait for both transfers to complete
+	transferWg.Wait()
+	log.Printf("[SUCCESS] Duplex transfer confirmed.")
+
+	// Cleanup
+	client.Close(nil)
+	server.Close(nil)
+	connWg.Wait()
+}
+
+func TestKeepAlive(t *testing.T) {
+	// Use short intervals for the test
+	keepAliveInterval := 1 * time.Second
+
+	// The overall test timeout should be long enough to allow for a keep-alive exchange
+	ctx, cancel := context.WithTimeout(context.Background(), keepAliveInterval*4)
+	defer cancel()
+
+	transport := newMockTransport()
+	client, err := NewConnection(transport, true)
+	require.NoError(t, err)
+	client.keepAliveInterval = keepAliveInterval // Override for test
+
+	server, err := NewConnection(transport.Inverted(), false)
+	require.NoError(t, err)
+	server.keepAliveInterval = keepAliveInterval // Override for test
+
+	var connWg sync.WaitGroup
+	connWg.Add(2)
+	go func() { defer connWg.Done(); runConnection(t, ctx, client) }()
+	go func() { defer connWg.Done(); runConnection(t, ctx, server) }()
+
+	// Complete the handshake
+	client.sendQueue <- &wire.PingFrame{}
+	<-client.handshakeCompleteChan
+	<-server.handshakeCompleteChan
+
+	log.Printf("[TEST] Handshake complete. Idling to trigger keep-alive after %v...", keepAliveInterval)
+
+	// Wait for a duration that should trigger a keep-alive PING but not a timeout.
+	time.Sleep(keepAliveInterval + keepAliveInterval/2)
+
+	// To verify the connection is still alive, send a new PING and expect it to work.
+	// We'll wrap this in a goroutine because the sendQueue could block if the connection
+	// had already closed incorrectly.
+	sendSuccessful := make(chan bool, 1)
+	go func() {
+		client.sendQueue <- &wire.PingFrame{}
+		sendSuccessful <- true
+	}()
+
+	select {
+	case <-sendSuccessful:
+		log.Printf("[SUCCESS] Connection is still alive after keep-alive interval.")
+	case <-time.After(1 * time.Second):
+		t.Fatal("Failed to send PING; connection appears to be closed or deadlocked.")
+	}
+
+	// Cleanly shut down
+	client.Close(nil)
+	server.Close(nil)
+	connWg.Wait()
+}
+
+func TestIdleTimeoutWithNetworkFailure(t *testing.T) {
+	// Use short intervals for the test.
+	idleTimeout := 3 * time.Second
+	keepAliveInterval := 1 * time.Second
+
+	// The overall test context timeout prevents the test from hanging forever.
+	ctx, cancel := context.WithTimeout(context.Background(), idleTimeout*3)
+	defer cancel()
+
+	underlying := newMockTransport()
+	// The client transport is normal.
+	clientTransport := underlying
+	// The server transport will drop all outgoing packets after the handshake.
+	serverTransport := newAdverseTransport(underlying.Inverted(), 0, 0, 1.0, 0, 0) // 100% loss
+
+	client, err := NewConnection(clientTransport, true)
+	require.NoError(t, err)
+	client.idleTimeout = idleTimeout
+	client.keepAliveInterval = keepAliveInterval
+
+	server, err := NewConnection(serverTransport, false)
+	require.NoError(t, err)
+	server.idleTimeout = idleTimeout
+	server.keepAliveInterval = keepAliveInterval
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	clientErrChan := make(chan error, 1)
+
+	go func() {
+		defer wg.Done()
+		clientErrChan <- client.Run(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		// We don't need to check the server's error, just that it exits.
+		_ = server.Run(ctx)
+	}()
+
+	// Complete the handshake (which adverseTransport allows).
+	client.sendQueue <- &wire.PingFrame{}
+	<-client.handshakeCompleteChan
+	<-server.handshakeCompleteChan
+
+	log.Printf("[TEST] Handshake complete. Simulating network failure. Client should time out after ~%v", idleTimeout)
+
+	// Wait specifically for the client's result. This is the behavior under test.
+	var clientErr error
+	select {
+	case clientErr = <-clientErrChan:
+		log.Printf("[TEST] Client returned with error: %v", clientErr)
+	case <-ctx.Done():
+		t.Fatal("Test timed out before client could return an error.")
+	}
+
+	// Now that we have the client's result, we can cancel the context to clean up the server.
+	cancel()
+
+	// Wait for all goroutines to fully exit.
+	wg.Wait()
+
+	// Finally, assert that the client returned the correct error.
+	require.Error(t, clientErr, "Client should have returned an error")
+	require.Contains(t, clientErr.Error(), "idle timeout", "Client error should be due to idle timeout")
+	log.Printf("[SUCCESS] Client correctly closed connection due to idle timeout.")
 }
