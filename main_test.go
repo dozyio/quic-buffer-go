@@ -1,4 +1,4 @@
-package main
+package quicbuffer
 
 import (
 	"bytes"
@@ -620,12 +620,11 @@ func TestDuplexTransfer(t *testing.T) {
 
 	const dataSize = 10 * 1024 * 1024 // 10 MB
 	var transferWg sync.WaitGroup
-	transferWg.Add(2) // We wait for two transfers to complete
+	transferWg.Add(2)
 
 	// --- Transfer 1: Client to Server ---
 	go func() {
 		defer transferWg.Done()
-		// Prepare data
 		clientData := make([]byte, dataSize)
 		_, err := rand.Read(clientData)
 		require.NoError(t, err)
@@ -657,7 +656,6 @@ func TestDuplexTransfer(t *testing.T) {
 	// --- Transfer 2: Server to Client ---
 	go func() {
 		defer transferWg.Done()
-		// Prepare data
 		serverData := make([]byte, dataSize)
 		_, err := rand.Read(serverData)
 		require.NoError(t, err)
@@ -686,7 +684,6 @@ func TestDuplexTransfer(t *testing.T) {
 		require.True(t, bytes.Equal(serverData, receivedData), "server-to-client data mismatch")
 	}()
 
-	// Wait for both transfers to complete
 	transferWg.Wait()
 	log.Printf("[SUCCESS] Duplex transfer confirmed.")
 
@@ -697,7 +694,6 @@ func TestDuplexTransfer(t *testing.T) {
 }
 
 func TestKeepAlive(t *testing.T) {
-	// Use short intervals for the test
 	keepAliveInterval := 1 * time.Second
 
 	// The overall test timeout should be long enough to allow for a keep-alive exchange
@@ -729,8 +725,6 @@ func TestKeepAlive(t *testing.T) {
 	time.Sleep(keepAliveInterval + keepAliveInterval/2)
 
 	// To verify the connection is still alive, send a new PING and expect it to work.
-	// We'll wrap this in a goroutine because the sendQueue could block if the connection
-	// had already closed incorrectly.
 	sendSuccessful := make(chan bool, 1)
 	go func() {
 		client.sendQueue <- &wire.PingFrame{}
@@ -744,25 +738,20 @@ func TestKeepAlive(t *testing.T) {
 		t.Fatal("Failed to send PING; connection appears to be closed or deadlocked.")
 	}
 
-	// Cleanly shut down
 	client.Close(nil)
 	server.Close(nil)
 	connWg.Wait()
 }
 
 func TestIdleTimeoutWithNetworkFailure(t *testing.T) {
-	// Use short intervals for the test.
 	idleTimeout := 3 * time.Second
 	keepAliveInterval := 1 * time.Second
 
-	// The overall test context timeout prevents the test from hanging forever.
 	ctx, cancel := context.WithTimeout(context.Background(), idleTimeout*3)
 	defer cancel()
 
 	underlying := newMockTransport()
-	// The client transport is normal.
 	clientTransport := underlying
-	// The server transport will drop all outgoing packets after the handshake.
 	serverTransport := newAdverseTransport(underlying.Inverted(), 0, 0, 1.0, 0, 0) // 100% loss
 
 	client, err := NewConnection(clientTransport, true)
@@ -785,18 +774,15 @@ func TestIdleTimeoutWithNetworkFailure(t *testing.T) {
 	}()
 	go func() {
 		defer wg.Done()
-		// We don't need to check the server's error, just that it exits.
 		_ = server.Run(ctx)
 	}()
 
-	// Complete the handshake (which adverseTransport allows).
 	client.sendQueue <- &wire.PingFrame{}
 	<-client.handshakeCompleteChan
 	<-server.handshakeCompleteChan
 
 	log.Printf("[TEST] Handshake complete. Simulating network failure. Client should time out after ~%v", idleTimeout)
 
-	// Wait specifically for the client's result. This is the behavior under test.
 	var clientErr error
 	select {
 	case clientErr = <-clientErrChan:
@@ -805,13 +791,10 @@ func TestIdleTimeoutWithNetworkFailure(t *testing.T) {
 		t.Fatal("Test timed out before client could return an error.")
 	}
 
-	// Now that we have the client's result, we can cancel the context to clean up the server.
 	cancel()
 
-	// Wait for all goroutines to fully exit.
 	wg.Wait()
 
-	// Finally, assert that the client returned the correct error.
 	require.Error(t, clientErr, "Client should have returned an error")
 	require.Contains(t, clientErr.Error(), "idle timeout", "Client error should be due to idle timeout")
 	log.Printf("[SUCCESS] Client correctly closed connection due to idle timeout.")
