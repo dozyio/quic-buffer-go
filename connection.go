@@ -201,14 +201,17 @@ func (c *Connection) receiveLoop(ctx context.Context) error {
 			if err != nil {
 				continue
 			}
+
 			extHdr, err := hdr.ParseExtended(data)
 			if err != nil {
 				continue
 			}
+
 			payload, err = c.longHeaderOpener.Open(nil, packetData[extHdr.ParsedLen():], extHdr.PacketNumber, packetData[:extHdr.ParsedLen()])
 			if err != nil {
 				continue
 			}
+
 			encLevel = protocol.EncryptionInitial
 
 			c.ackMu.Lock()
@@ -502,7 +505,10 @@ func (c *Connection) packAndSendPacket(frames []wire.Frame, encLevel protocol.En
 			c.ackMu.Unlock()
 			return nil, err
 		}
-		payload = c.longHeaderSealer.Seal(nil, payloadBuf.Bytes(), pn, raw)
+
+		// payload = c.longHeaderSealer.Seal(nil, payloadBuf.Bytes(), pn, raw) // skip Seal as we don't encrypt
+		payload = payloadBuf.Bytes()
+
 		if c.isClient && !c.initialPacketSent {
 			c.initialPacketSent = true
 			c.handshakeTimer = time.NewTimer(c.handshakeTimeout)
@@ -515,7 +521,9 @@ func (c *Connection) packAndSendPacket(frames []wire.Frame, encLevel protocol.En
 			c.ackMu.Unlock()
 			return nil, err
 		}
-		payload = c.shortHeaderSealer.Seal(nil, payloadBuf.Bytes(), pn, raw)
+		// payload = c.shortHeaderSealer.Seal(nil, payloadBuf.Bytes(), pn, raw) // skip Seal as we don't encrypt
+		payload = payloadBuf.Bytes()
+		// payload = c.shortHeaderSealer.Seal(nil, payloadBuf.Bytes(), pn, raw)
 	}
 
 	c.sentPacketHandler.SentPacket(
