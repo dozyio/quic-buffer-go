@@ -115,11 +115,8 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 	totalLen := len(p)
 	bytesSent := 0
 	for bytesSent < totalLen {
-		const maxFrameDataSize = 1200
-		end := bytesSent + maxFrameDataSize
-		if end > totalLen {
-			end = totalLen
-		}
+		const maxFrameDataSize = InitialPacketSize
+		end := min(bytesSent+maxFrameDataSize, totalLen)
 		chunk := p[bytesSent:end]
 		s.conn.sendStreamData(s.id, chunk, false, s.writeOffset)
 		s.writeOffset += protocol.ByteCount(len(chunk))

@@ -73,7 +73,11 @@ type Connection struct {
 }
 
 func NewConnection(transport LowerLayerTransport, isClient bool) (*Connection, error) {
-	connID, _ := protocol.GenerateConnectionID(8)
+	connID, err := protocol.GenerateConnectionID(8)
+	if err != nil {
+		return nil, err
+	}
+
 	logger := &dummyLogger{}
 	rttStats := &utils.RTTStats{}
 	perspective := protocol.PerspectiveClient
@@ -97,6 +101,7 @@ func NewConnection(transport LowerLayerTransport, isClient bool) (*Connection, e
 		handshakeTimeout:      1 * time.Second,
 		sendingScheduled:      make(chan struct{}, 1),
 	}
+
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	c.retransmissionQueue = newRetransmissionQueue(c)
 	c.congestionController = congestion.NewCubicSender(congestion.DefaultClock{}, c.rttStats, protocol.InitialPacketSize, true, nil)
@@ -104,11 +109,13 @@ func NewConnection(transport LowerLayerTransport, isClient bool) (*Connection, e
 		protocol.DefaultInitialMaxData, protocol.DefaultMaxReceiveConnectionFlowControlWindow,
 		func(protocol.ByteCount) bool { return true }, c.rttStats, c.logger,
 	)
+
 	if isClient {
 		c.nextStreamID = 0
 	} else {
 		c.nextStreamID = 1
 	}
+
 	sentPacketHandler, receivedPacketHandler := ackhandler.NewAckHandler(0, protocol.InitialPacketSize, c.rttStats, !isClient, false, perspective, nil, c.logger)
 	c.sentPacketHandler = sentPacketHandler
 	c.receivedPacketHandler = receivedPacketHandler
@@ -118,6 +125,7 @@ func NewConnection(transport LowerLayerTransport, isClient bool) (*Connection, e
 func (c *Connection) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	errChan := make(chan error, 2)
+
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
@@ -126,6 +134,7 @@ func (c *Connection) Run(ctx context.Context) error {
 			errChan <- err
 		}
 	}()
+
 	go func() {
 		defer wg.Done()
 		err := c.sendLoop(c.ctx)
@@ -133,6 +142,7 @@ func (c *Connection) Run(ctx context.Context) error {
 			errChan <- err
 		}
 	}()
+
 	select {
 	case err := <-errChan:
 		c.Close(err)
@@ -154,11 +164,13 @@ func (c *Connection) receiveLoop(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+
 		var (
 			payload                        []byte
 			encLevel                       protocol.EncryptionLevel
 			handshakeCompletedInThisPacket bool
 		)
+
 		if wire.IsLongHeaderPacket(data[0]) {
 			c.ackMu.Lock()
 			if c.initialKeysDropped {
@@ -180,6 +192,7 @@ func (c *Connection) receiveLoop(ctx context.Context) error {
 				continue
 			}
 			encLevel = protocol.EncryptionInitial
+
 			c.ackMu.Lock()
 			if c.isClient && !c.handshakeComplete {
 				handshakeCompletedInThisPacket = true
@@ -189,7 +202,13 @@ func (c *Connection) receiveLoop(ctx context.Context) error {
 				}
 				close(c.handshakeCompleteChan)
 			}
-			c.receivedPacketHandler.ReceivedPacket(extHdr.PacketNumber, protocol.ECNUnsupported, encLevel, time.Now(), true)
+
+			err = c.receivedPacketHandler.ReceivedPacket(extHdr.PacketNumber, protocol.ECNUnsupported, encLevel, time.Now(), true)
+			if err != nil {
+				log.Printf("[%s] Error processing packet: %v", c.side(), err)
+				c.ackMu.Unlock()
+				continue
+			}
 			c.ackMu.Unlock()
 		} else { // Short Header Packet
 			_, pn, pnLen, kp, err := wire.ParseShortHeader(data, c.destConnID.Len())
@@ -202,6 +221,7 @@ func (c *Connection) receiveLoop(ctx context.Context) error {
 				continue
 			}
 			encLevel = protocol.Encryption1RTT
+
 			c.ackMu.Lock()
 			if !c.isClient && !c.initialKeysDropped {
 				c.sentPacketHandler.DropPackets(protocol.EncryptionInitial, time.Now())
@@ -209,9 +229,13 @@ func (c *Connection) receiveLoop(ctx context.Context) error {
 				c.initialKeysDropped = true
 				log.Printf("[%s] Received first 1-RTT packet. Dropping Initial packet space.", c.side())
 			}
-			c.receivedPacketHandler.ReceivedPacket(pn, protocol.ECNUnsupported, encLevel, time.Now(), true)
+			err = c.receivedPacketHandler.ReceivedPacket(pn, protocol.ECNUnsupported, encLevel, time.Now(), true)
+			if err != nil {
+				log.Printf("[%s] Error processing packet: %v", c.side(), err)
+			}
 			c.ackMu.Unlock()
 		}
+
 		c.processFrames(frameParser, payload, encLevel)
 		if handshakeCompletedInThisPacket {
 			c.ackMu.Lock()
@@ -384,7 +408,7 @@ func (c *Connection) packAndSendPacket(frames []wire.Frame, encLevel protocol.En
 	var ackFramesInPacket []ackhandler.Frame
 	var cutoff int
 	isAckEliciting := false
-	maxPacketSize := protocol.InitialPacketSize - 40
+	maxPacketSize := InitialPacketSize
 	handler := c.retransmissionQueue.FrameHandler(encLevel)
 	for i, frame := range frames {
 		if _, isAck := frame.(*wire.AckFrame); !isAck {
@@ -520,7 +544,15 @@ func (c *Connection) side() string {
 
 var packetBufferPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 
-func getPacketBuffer() *bytes.Buffer { return packetBufferPool.Get().(*bytes.Buffer) }
+func getPacketBuffer() *bytes.Buffer {
+	buf, ok := packetBufferPool.Get().(*bytes.Buffer)
+	if !ok {
+		return nil
+	}
+
+	return buf
+}
+
 func putPacketBuffer(buf *bytes.Buffer) {
 	buf.Reset()
 	packetBufferPool.Put(buf)
