@@ -257,7 +257,7 @@ func (h *sentPacketHandler) SentPacket(
 	pnSpace := h.getPacketNumberSpace(encLevel)
 	if h.logger.Debug() && (pnSpace.history.HasOutstandingPackets() || pnSpace.history.HasOutstandingPathProbes()) {
 		for p := max(0, pnSpace.largestSent+1); p < pn; p++ {
-			h.logger.Debugf("Skipping packet number %d", p)
+			h.logger.Debugf("SendPacket Skipping packet number %d", p)
 		}
 	}
 
@@ -833,7 +833,7 @@ func (h *sentPacketHandler) PopPacketNumber(encLevel protocol.EncryptionLevel) p
 		skippedPN := pn - 1
 		pnSpace.history.SkippedPacket(skippedPN)
 		if h.logger.Debug() {
-			h.logger.Debugf("Skipping packet number %d", skippedPN)
+			h.logger.Debugf("PopPacketNumber Skipping packet number %d", skippedPN)
 		}
 	}
 	return pn

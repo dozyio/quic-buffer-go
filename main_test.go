@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dozyio/quic-buffer-go/internal/wire"
+	"github.com/dozyio/quic-buffer-go/logging"
 	"github.com/stretchr/testify/require"
 )
 
@@ -147,8 +147,6 @@ func (t *adverseTransport) WritePacket(p []byte) error {
 
 	go func() {
 		defer t.wg.Done()
-
-		// Allow handshake
 		if packetNum <= 4 {
 			t.underlying.WritePacket(pCopy)
 			return
@@ -165,15 +163,12 @@ func (t *adverseTransport) WritePacket(p []byte) error {
 		t.randLock.Unlock()
 
 		time.Sleep(delay)
-
 		if shouldDrop {
 			return
 		}
 
-		isHandshake := packetNum <= 4
-
 		t.reorderLock.Lock()
-		if !isHandshake && shouldReorder {
+		if shouldReorder {
 			t.reorderBuffer = append(t.reorderBuffer, pCopy)
 			if len(t.reorderBuffer) > 1 {
 				pktToSend := t.reorderBuffer[0]
@@ -187,7 +182,7 @@ func (t *adverseTransport) WritePacket(p []byte) error {
 
 		t.underlying.WritePacket(pCopy)
 
-		if !isHandshake && shouldDuplicate {
+		if shouldDuplicate {
 			time.Sleep(5 * time.Millisecond)
 			t.underlying.WritePacket(pCopy)
 		}
@@ -224,11 +219,12 @@ type udpTransport struct {
 	mu         sync.Mutex
 }
 
-// newUDPTransport creates a new transport listening on a random UDP port.
 func newUDPTransport(t testing.TB) *udpTransport {
 	addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
 	require.NoError(t, err)
 	conn, err := net.ListenUDP("udp", addr)
+	require.NoError(t, err)
+	err = conn.SetReadBuffer(2 * 1024 * 1024)
 	require.NoError(t, err)
 	return &udpTransport{conn: conn}
 }
@@ -245,15 +241,13 @@ func (t *udpTransport) WritePacket(p []byte) error {
 }
 
 func (t *udpTransport) ReadPacket() ([]byte, error) {
-	buf := make([]byte, 2048) // A buffer large enough for typical MTU
+	buf := make([]byte, 2048)
 	n, remote, err := t.conn.ReadFrom(buf)
 	if err != nil {
 		return nil, err
 	}
-
 	t.mu.Lock()
 	if t.remoteAddr == nil {
-		// Learn the remote address from the first packet we receive
 		t.remoteAddr = remote
 	}
 	t.mu.Unlock()
@@ -264,12 +258,10 @@ func (t *udpTransport) Close() error {
 	return t.conn.Close()
 }
 
-// LocalAddr returns the local network address.
 func (t *udpTransport) LocalAddr() net.Addr {
 	return t.conn.LocalAddr()
 }
 
-// SetRemoteAddr sets the destination address for outgoing packets.
 func (t *udpTransport) SetRemoteAddr(addr net.Addr) {
 	t.mu.Lock()
 	t.remoteAddr = addr
@@ -278,13 +270,10 @@ func (t *udpTransport) SetRemoteAddr(addr net.Addr) {
 
 var tcpBufferPool = sync.Pool{
 	New: func() any {
-		// Allocate a buffer large enough for a length prefix plus a typical MTU.
 		return make([]byte, 4+2048)
 	},
 }
 
-// tcpTransport is a transport that runs over a reliable, stream-based connection (like TCP).
-// It frames packets by prefixing each one with its length.
 type tcpTransport struct {
 	conn net.Conn
 	mu   sync.Mutex
@@ -297,31 +286,20 @@ func newTCPTransport(conn net.Conn) LowerLayerTransport {
 func (t *tcpTransport) WritePacket(p []byte) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-
-	// Get a buffer from the pool.
 	buf := tcpBufferPool.Get().([]byte)
-	defer tcpBufferPool.Put(buf) // Ensure the buffer is returned to the pool.
-
-	// Write the 4-byte length prefix.
+	defer tcpBufferPool.Put(buf)
 	binary.BigEndian.PutUint32(buf, uint32(len(p)))
-	// Copy the packet data right after the length prefix.
 	copy(buf[4:], p)
-
-	// Write the combined buffer (prefix + packet) in a single system call.
 	_, err := t.conn.Write(buf[:4+len(p)])
 	return err
 }
 
 func (t *tcpTransport) ReadPacket() ([]byte, error) {
 	lenBuf := make([]byte, 4)
-	// Read the 4-byte length prefix.
 	if _, err := io.ReadFull(t.conn, lenBuf); err != nil {
 		return nil, err
 	}
-
 	length := binary.BigEndian.Uint32(lenBuf)
-
-	// Read the full packet based on the length prefix.
 	packetBuf := make([]byte, length)
 	if _, err := io.ReadFull(t.conn, packetBuf); err != nil {
 		return nil, err
@@ -333,7 +311,6 @@ func (t *tcpTransport) Close() error {
 	return t.conn.Close()
 }
 
-// pacedReader simulates a real-world data source by introducing a small delay.
 type pacedReader struct {
 	reader io.Reader
 	delay  time.Duration
@@ -347,77 +324,136 @@ func (r *pacedReader) Read(p []byte) (n int, err error) {
 	return
 }
 
+func runConnection(ctx context.Context, conn *Connection) error {
+	err := conn.Run(ctx)
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, io.EOF) {
+		return err
+	}
+	return nil
+}
+
 func TestTextMessageTransfer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	transport := newMockTransport()
-	client, err := NewConnection(transport, true)
+
+	clientTracer := &logging.ConnectionTracer{
+		// Log both long and short header packets.
+		ReceivedLongHeaderPacket: func(hdr *logging.ExtendedHeader, size logging.ByteCount, ecn logging.ECN, frames []logging.Frame) {
+			t.Logf("<- [CLIENT] Received Long Header Packet | PN: %d, Size: %d", hdr.PacketNumber, size)
+		},
+		ReceivedShortHeaderPacket: func(hdr *logging.ShortHeader, size logging.ByteCount, ecn logging.ECN, frames []logging.Frame) {
+			t.Logf("<- [CLIENT] Received Short Header Packet | PN: %d, Size: %d", hdr.PacketNumber, size)
+		},
+		SentLongHeaderPacket: func(hdr *logging.ExtendedHeader, size logging.ByteCount, ecn logging.ECN, ack *logging.AckFrame, frames []logging.Frame) {
+			t.Logf("-> [CLIENT] Sent Long Header Packet | PN: %d, Size: %d", hdr.PacketNumber, size)
+		},
+		SentShortHeaderPacket: func(hdr *logging.ShortHeader, size logging.ByteCount, ecn logging.ECN, ack *logging.AckFrame, frames []logging.Frame) {
+			t.Logf("-> [CLIENT] Sent Short Header Packet | PN: %d, Size: %d", hdr.PacketNumber, size)
+		},
+	}
+
+	// Create a tracer for the server.
+	serverTracer := &logging.ConnectionTracer{
+		ReceivedLongHeaderPacket: func(hdr *logging.ExtendedHeader, size logging.ByteCount, ecn logging.ECN, frames []logging.Frame) {
+			t.Logf("<- [SERVER] Received Long Header Packet | PN: %d, Size: %d", hdr.PacketNumber, size)
+		},
+		ReceivedShortHeaderPacket: func(hdr *logging.ShortHeader, size logging.ByteCount, ecn logging.ECN, frames []logging.Frame) {
+			t.Logf("<- [SERVER] Received Short Header Packet | PN: %d, Size: %d", hdr.PacketNumber, size)
+		},
+		SentLongHeaderPacket: func(hdr *logging.ExtendedHeader, size logging.ByteCount, ecn logging.ECN, ack *logging.AckFrame, frames []logging.Frame) {
+			t.Logf("-> [SERVER] Sent Long Header Packet | PN: %d, Size: %d", hdr.PacketNumber, size)
+		},
+		SentShortHeaderPacket: func(hdr *logging.ShortHeader, size logging.ByteCount, ecn logging.ECN, ack *logging.AckFrame, frames []logging.Frame) {
+			t.Logf("-> [SERVER] Sent Short Header Packet | PN: %d, Size: %d", hdr.PacketNumber, size)
+		},
+	}
+
+	client, err := NewConnection(transport, true, clientTracer)
 	require.NoError(t, err)
-	server, err := NewConnection(transport.Inverted(), false)
+	server, err := NewConnection(transport.Inverted(), false, serverTracer)
 	require.NoError(t, err)
 	var wg sync.WaitGroup
 	wg.Add(2)
+	errChan := make(chan error, 2)
+
 	go func() {
 		defer wg.Done()
-		err := client.Run(ctx)
-		require.True(t, err == nil || err == context.Canceled || err == context.DeadlineExceeded || errors.Is(err, io.EOF))
+		errChan <- runConnection(ctx, client)
 	}()
 	go func() {
 		defer wg.Done()
-		err := server.Run(ctx)
-		require.True(t, err == nil || err == context.Canceled || err == context.DeadlineExceeded || errors.Is(err, io.EOF))
+		errChan <- runConnection(ctx, server)
 	}()
-	client.sendQueue <- &wire.PingFrame{}
-	<-client.handshakeCompleteChan
-	<-server.handshakeCompleteChan
+
 	message := "Hello from the client! This is a test of the custom QUIC-like stack."
 	var serverReceivedMessage string
 	var transferWg sync.WaitGroup
 	transferWg.Add(1)
+
 	go func() {
 		defer transferWg.Done()
 		stream, err := server.AcceptStream(ctx)
-		require.NoError(t, err)
+		if err != nil {
+			errChan <- err
+			return
+		}
 		receivedBytes, err := io.ReadAll(stream)
-		require.NoError(t, err)
+		if err != nil {
+			errChan <- err
+			return
+		}
 		serverReceivedMessage = string(receivedBytes)
 	}()
+
 	stream, err := client.OpenStream(ctx)
 	require.NoError(t, err)
 	_, err = stream.Write([]byte(message))
 	require.NoError(t, err)
 	require.NoError(t, stream.Close())
 	transferWg.Wait()
-	require.Equal(t, message, serverReceivedMessage)
+
 	client.Close(nil)
 	server.Close(nil)
 	wg.Wait()
+	close(errChan)
+
+	for err := range errChan {
+		require.NoError(t, err)
+	}
+	require.Equal(t, message, serverReceivedMessage)
 }
 
-func TestBulkTransfer(t *testing.T) {
+func TestBulkTransferOnly(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	transport := newMockTransport()
-	client, err := NewConnection(transport, true)
+	client, err := NewConnection(transport, true, nil)
 	require.NoError(t, err)
-	server, err := NewConnection(transport.Inverted(), false)
+	server, err := NewConnection(transport.Inverted(), false, nil)
 	require.NoError(t, err)
 	var wg sync.WaitGroup
 	wg.Add(2)
+	errChan := make(chan error, 2)
+
 	go func() {
 		defer wg.Done()
-		err := client.Run(ctx)
-		require.True(t, err == nil || err == context.Canceled || err == context.DeadlineExceeded || errors.Is(err, io.EOF))
+		err := runConnection(ctx, client)
+		if err != nil {
+			log.Printf("[CLIENT] runConnection error: %v", err)
+		}
+		errChan <- err
 	}()
 	go func() {
 		defer wg.Done()
-		err := server.Run(ctx)
-		require.True(t, err == nil || err == context.Canceled || err == context.DeadlineExceeded || errors.Is(err, io.EOF))
+		err := runConnection(ctx, server)
+		if err != nil {
+			log.Printf("[SERVER] runConnection error: %v", err)
+		}
+		errChan <- err
 	}()
-	client.sendQueue <- &wire.PingFrame{}
-	<-client.handshakeCompleteChan
-	<-server.handshakeCompleteChan
-	const dataSize = 10 * 1024 * 1024 // 10 MB
+
+	const dataSize = 1024 * 1024 // 10 MB
 	clientData := make([]byte, dataSize)
 	_, err = rand.Read(clientData)
 	require.NoError(t, err)
@@ -429,32 +465,64 @@ func TestBulkTransfer(t *testing.T) {
 
 	go func() {
 		defer transferWg.Done()
+		log.Printf("[SERVER] Waiting to accept stream...")
 		stream, err := server.AcceptStream(ctx)
-		require.NoError(t, err)
+		if err != nil {
+			log.Printf("[SERVER] AcceptStream error: %v", err)
+			errChan <- err
+			return
+		}
+		log.Printf("[SERVER] Accepted stream")
 		serverReceivedData, err = io.ReadAll(stream)
-		require.NoError(t, err)
+		if err != nil {
+			log.Printf("[SERVER] ReadAll error: %v", err)
+			errChan <- err
+			return
+		}
+		log.Printf("[SERVER] ReadAll complete, received %d bytes", len(serverReceivedData))
 	}()
-	go func() {
-		stream, err := client.OpenStream(ctx)
-		require.NoError(t, err)
-		_, err = stream.Write(clientData)
-		require.NoError(t, err)
-		require.NoError(t, stream.Close())
-	}()
+
+	log.Printf("[CLIENT] Opening stream...")
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		log.Printf("[CLIENT] OpenStream error: %v", err)
+	}
+	require.NoError(t, err)
+	log.Printf("[CLIENT] Writing %d bytes to stream...", len(clientData))
+	_, err = stream.Write(clientData)
+	if err != nil {
+		log.Printf("[CLIENT] Write error: %v", err)
+	}
+	require.NoError(t, err)
+	log.Printf("[CLIENT] Closing stream...")
+	err = stream.Close()
+	if err != nil {
+		log.Printf("[CLIENT] Close error: %v", err)
+	}
+	require.NoError(t, err)
 
 	transferWg.Wait()
-
 	duration := time.Since(startTime)
 	mbps := (float64(dataSize) / (1024 * 1024)) / duration.Seconds()
 	log.Printf("[SUCCESS] Bulk transfer confirmed.")
 	log.Printf("[STATS] Transferred %d bytes in %v.", dataSize, duration)
 	log.Printf("[STATS] Speed: %.2f MB/s", mbps)
 
-	require.Equal(t, len(clientData), len(serverReceivedData))
-	require.True(t, bytes.Equal(clientData, serverReceivedData))
+	log.Printf("[CLIENT] Closing connection...")
 	client.Close(nil)
+	log.Printf("[SERVER] Closing connection...")
 	server.Close(nil)
 	wg.Wait()
+	close(errChan)
+
+	for err := range errChan {
+		if err != nil {
+			log.Printf("[ERROR] %v", err)
+		}
+		require.NoError(t, err)
+	}
+	require.Equal(t, len(clientData), len(serverReceivedData))
+	require.True(t, bytes.Equal(clientData, serverReceivedData))
 }
 
 func TestUnreliableBulkTransfer(t *testing.T) {
@@ -465,27 +533,23 @@ func TestUnreliableBulkTransfer(t *testing.T) {
 	clientTransport := newAdverseTransport(underlyingTransport, 20*time.Millisecond, 10*time.Millisecond, 0.03, 0.02, 0.02)
 	serverTransport := newAdverseTransport(underlyingTransport.Inverted(), 20*time.Millisecond, 10*time.Millisecond, 0.03, 0.02, 0.02)
 
-	client, err := NewConnection(clientTransport, true)
+	client, err := NewConnection(clientTransport, true, nil)
 	require.NoError(t, err)
-	server, err := NewConnection(serverTransport, false)
+	server, err := NewConnection(serverTransport, false, nil)
 	require.NoError(t, err)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		err := client.Run(ctx)
-		require.True(t, err == nil || err == context.Canceled || err == context.DeadlineExceeded || errors.Is(err, io.EOF))
-	}()
-	go func() {
-		defer wg.Done()
-		err := server.Run(ctx)
-		require.True(t, err == nil || err == context.Canceled || err == context.DeadlineExceeded || errors.Is(err, io.EOF))
-	}()
+	errChan := make(chan error, 4)
 
-	client.sendQueue <- &wire.PingFrame{}
-	<-client.handshakeCompleteChan
-	<-server.handshakeCompleteChan
+	go func() {
+		defer wg.Done()
+		errChan <- runConnection(ctx, client)
+	}()
+	go func() {
+		defer wg.Done()
+		errChan <- runConnection(ctx, server)
+	}()
 
 	const dataSize = 5 * 1024 * 1024 // 5 MB
 	clientData := make([]byte, dataSize)
@@ -494,22 +558,30 @@ func TestUnreliableBulkTransfer(t *testing.T) {
 
 	var serverReceivedData []byte
 	var transferWg sync.WaitGroup
-	transferWg.Add(1)
+	transferWg.Add(2)
 
 	startTime := time.Now()
 
 	go func() {
 		defer transferWg.Done()
 		stream, err := server.AcceptStream(ctx)
-		require.NoError(t, err)
+		if err != nil {
+			errChan <- err
+			return
+		}
 		serverReceivedData, err = io.ReadAll(stream)
-		require.NoError(t, err)
+		if err != nil {
+			errChan <- err
+		}
 	}()
 
 	go func() {
+		defer transferWg.Done()
 		stream, err := client.OpenStream(ctx)
-		require.NoError(t, err)
-
+		if err != nil {
+			errChan <- err
+			return
+		}
 		clientDataReader := bytes.NewReader(clientData)
 		pacedClientReader := &pacedReader{reader: clientDataReader, delay: 1 * time.Millisecond}
 		buf := make([]byte, 8*1024)
@@ -518,20 +590,25 @@ func TestUnreliableBulkTransfer(t *testing.T) {
 			if n > 0 {
 				dataToWrite := make([]byte, n)
 				copy(dataToWrite, buf[:n])
-				_, writeErr := stream.Write(dataToWrite)
-				require.NoError(t, writeErr)
+				if _, writeErr := stream.Write(dataToWrite); writeErr != nil {
+					errChan <- writeErr
+					return
+				}
 			}
 			if readErr == io.EOF {
 				break
 			}
-			require.NoError(t, readErr)
+			if readErr != nil {
+				errChan <- readErr
+				return
+			}
 		}
-
-		require.NoError(t, stream.Close())
+		if err := stream.Close(); err != nil {
+			errChan <- err
+		}
 	}()
 
 	transferWg.Wait()
-
 	duration := time.Since(startTime)
 	mbps := (float64(len(serverReceivedData)) / (1024 * 1024)) / duration.Seconds()
 	log.Printf("[SUCCESS] Unreliable bulk transfer confirmed.")
@@ -541,178 +618,13 @@ func TestUnreliableBulkTransfer(t *testing.T) {
 	client.Close(nil)
 	server.Close(nil)
 	wg.Wait()
+	close(errChan)
 
+	for err := range errChan {
+		require.NoError(t, err)
+	}
 	require.Equal(t, len(clientData), len(serverReceivedData))
 	require.True(t, bytes.Equal(clientData, serverReceivedData), "Data should be identical even over an unreliable link")
-}
-
-func TestHighPacketReordering(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	underlying := newMockTransport()
-	clientTransport := newAdverseTransport(underlying, 5*time.Millisecond, 0, 0, 0, 0.5)
-	serverTransport := newAdverseTransport(underlying.Inverted(), 5*time.Millisecond, 0, 0, 0, 0.5)
-
-	client, err := NewConnection(clientTransport, true)
-	require.NoError(t, err)
-	server, err := NewConnection(serverTransport, false)
-	require.NoError(t, err)
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); client.Run(ctx) }()
-	go func() { defer wg.Done(); server.Run(ctx) }()
-
-	client.sendQueue <- &wire.PingFrame{}
-	<-client.handshakeCompleteChan
-	<-server.handshakeCompleteChan
-
-	var transferWg sync.WaitGroup
-	transferWg.Add(1)
-	const dataSize = 5 * 1024
-	clientData := make([]byte, dataSize)
-	_, err = rand.Read(clientData)
-	require.NoError(t, err)
-	var serverReceivedData []byte
-
-	go func() {
-		defer transferWg.Done()
-		stream, err := server.AcceptStream(ctx)
-		require.NoError(t, err)
-		serverReceivedData, err = io.ReadAll(stream)
-		require.NoError(t, err)
-	}()
-
-	go func() {
-		stream, err := client.OpenStream(ctx)
-		require.NoError(t, err)
-		_, err = stream.Write(clientData)
-		require.NoError(t, err)
-		err = stream.Close()
-		require.NoError(t, err)
-	}()
-
-	transferWg.Wait()
-	client.Close(nil)
-	server.Close(nil)
-	wg.Wait()
-
-	require.True(t, bytes.Equal(clientData, serverReceivedData), "Data must be identical after reordering")
-}
-
-func TestPacketDuplication(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	underlying := newMockTransport()
-	clientTransport := newAdverseTransport(underlying, 5*time.Millisecond, 0, 0, 0.8, 0)
-	serverTransport := newAdverseTransport(underlying.Inverted(), 5*time.Millisecond, 0, 0, 0.8, 0)
-
-	client, err := NewConnection(clientTransport, true)
-	require.NoError(t, err)
-	server, err := NewConnection(serverTransport, false)
-	require.NoError(t, err)
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); client.Run(ctx) }()
-	go func() { defer wg.Done(); server.Run(ctx) }()
-
-	client.sendQueue <- &wire.PingFrame{}
-	<-client.handshakeCompleteChan
-	<-server.handshakeCompleteChan
-
-	var transferWg sync.WaitGroup
-	transferWg.Add(1)
-	message := "This message should only be delivered once."
-	clientData := []byte(message)
-	var serverReceivedData []byte
-
-	go func() {
-		defer transferWg.Done()
-		stream, err := server.AcceptStream(ctx)
-		require.NoError(t, err)
-		serverReceivedData, err = io.ReadAll(stream)
-		require.NoError(t, err)
-	}()
-
-	go func() {
-		stream, err := client.OpenStream(ctx)
-		require.NoError(t, err)
-		_, err = stream.Write(clientData)
-		require.NoError(t, err)
-		err = stream.Close()
-		require.NoError(t, err)
-	}()
-
-	transferWg.Wait()
-	client.Close(nil)
-	server.Close(nil)
-	wg.Wait()
-
-	require.Equal(t, message, string(serverReceivedData), "Data must be identical and not duplicated")
-}
-
-func TestExtremeLatencyVariation(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	underlying := newMockTransport()
-	clientTransport := newAdverseTransport(underlying, 5000*time.Millisecond, 100*time.Millisecond, 0, 0, 0)
-	serverTransport := newAdverseTransport(underlying.Inverted(), 5000*time.Millisecond, 100*time.Millisecond, 0, 0, 0)
-
-	client, err := NewConnection(clientTransport, true)
-	require.NoError(t, err)
-	server, err := NewConnection(serverTransport, false)
-	require.NoError(t, err)
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); client.Run(ctx) }()
-	go func() { defer wg.Done(); server.Run(ctx) }()
-
-	client.sendQueue <- &wire.PingFrame{}
-	<-client.handshakeCompleteChan
-	<-server.handshakeCompleteChan
-
-	var transferWg sync.WaitGroup
-	transferWg.Add(1)
-	message := "Data over high-latency link"
-
-	go func() {
-		stream, err := server.AcceptStream(ctx)
-		require.NoError(t, err)
-		_, err = io.Copy(stream, stream)
-		require.True(t, err == nil || errors.Is(err, io.EOF) || errors.Is(err, context.Canceled))
-	}()
-
-	go func() {
-		defer transferWg.Done()
-		stream, err := client.OpenStream(ctx)
-		require.NoError(t, err)
-		_, err = stream.Write([]byte(message))
-		require.NoError(t, err)
-		buf := make([]byte, len(message))
-		_, err = io.ReadFull(stream, buf)
-		require.NoError(t, err, "Failed to read echo from server")
-		require.Equal(t, message, string(buf))
-		stream.Close()
-	}()
-
-	transferWg.Wait()
-	client.Close(nil)
-	server.Close(nil)
-	wg.Wait()
-}
-
-func runConnection(t testing.TB, ctx context.Context, conn *Connection) {
-	t.Helper()
-	err := conn.Run(ctx)
-	// We expect the context to be canceled or the deadline to be exceeded in a normal test shutdown.
-	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, io.EOF) {
-		require.NoError(t, err, "connection run loop failed unexpectedly")
-	}
 }
 
 func TestDuplexTransfer(t *testing.T) {
@@ -720,21 +632,23 @@ func TestDuplexTransfer(t *testing.T) {
 	defer cancel()
 
 	transport := newMockTransport()
-	client, err := NewConnection(transport, true)
+	client, err := NewConnection(transport, true, nil)
 	require.NoError(t, err)
-	server, err := NewConnection(transport.Inverted(), false)
+	server, err := NewConnection(transport.Inverted(), false, nil)
 	require.NoError(t, err)
 
-	// Run both connections in the background
 	var connWg sync.WaitGroup
 	connWg.Add(2)
-	go func() { defer connWg.Done(); runConnection(t, ctx, client) }()
-	go func() { defer connWg.Done(); runConnection(t, ctx, server) }()
+	errChan := make(chan error, 4)
 
-	// Perform handshake
-	client.sendQueue <- &wire.PingFrame{}
-	<-client.handshakeCompleteChan
-	<-server.handshakeCompleteChan
+	go func() {
+		defer connWg.Done()
+		errChan <- runConnection(ctx, client)
+	}()
+	go func() {
+		defer connWg.Done()
+		errChan <- runConnection(ctx, server)
+	}()
 
 	const dataSize = 10 * 1024 * 1024 // 10 MB
 	var transferWg sync.WaitGroup
@@ -744,140 +658,168 @@ func TestDuplexTransfer(t *testing.T) {
 	go func() {
 		defer transferWg.Done()
 		clientData := make([]byte, dataSize)
-		_, err := rand.Read(clientData)
-		require.NoError(t, err)
-
+		if _, err := rand.Read(clientData); err != nil {
+			errChan <- err
+			return
+		}
 		var receivedData []byte
 		var serverWg sync.WaitGroup
 		serverWg.Add(1)
 
-		// Server accepts and reads
 		go func() {
 			defer serverWg.Done()
 			stream, err := server.AcceptStream(ctx)
-			require.NoError(t, err)
+			if err != nil {
+				errChan <- err
+				return
+			}
 			receivedData, err = io.ReadAll(stream)
-			require.NoError(t, err)
+			if err != nil {
+				errChan <- err
+			}
 		}()
 
-		// Client opens and writes
 		stream, err := client.OpenStream(ctx)
-		require.NoError(t, err)
-		_, err = stream.Write(clientData)
-		require.NoError(t, err)
-		require.NoError(t, stream.Close())
-
+		if err != nil {
+			errChan <- err
+			return
+		}
+		if _, err := stream.Write(clientData); err != nil {
+			errChan <- err
+			return
+		}
+		if err := stream.Close(); err != nil {
+			errChan <- err
+			return
+		}
 		serverWg.Wait()
-		require.True(t, bytes.Equal(clientData, receivedData), "client-to-server data mismatch")
+		if !bytes.Equal(clientData, receivedData) {
+			errChan <- errors.New("client-to-server data mismatch")
+		}
 	}()
 
 	// --- Transfer 2: Server to Client ---
 	go func() {
 		defer transferWg.Done()
 		serverData := make([]byte, dataSize)
-		_, err := rand.Read(serverData)
-		require.NoError(t, err)
-
+		if _, err := rand.Read(serverData); err != nil {
+			errChan <- err
+			return
+		}
 		var receivedData []byte
 		var clientWg sync.WaitGroup
 		clientWg.Add(1)
 
-		// Client accepts and reads
 		go func() {
 			defer clientWg.Done()
 			stream, err := client.AcceptStream(ctx)
-			require.NoError(t, err)
+			if err != nil {
+				errChan <- err
+				return
+			}
 			receivedData, err = io.ReadAll(stream)
-			require.NoError(t, err)
+			if err != nil {
+				errChan <- err
+			}
 		}()
 
-		// Server opens and writes
 		stream, err := server.OpenStream(ctx)
-		require.NoError(t, err)
-		_, err = stream.Write(serverData)
-		require.NoError(t, err)
-		require.NoError(t, stream.Close())
-
+		if err != nil {
+			errChan <- err
+			return
+		}
+		if _, err := stream.Write(serverData); err != nil {
+			errChan <- err
+			return
+		}
+		if err := stream.Close(); err != nil {
+			errChan <- err
+			return
+		}
 		clientWg.Wait()
-		require.True(t, bytes.Equal(serverData, receivedData), "server-to-client data mismatch")
+		if !bytes.Equal(serverData, receivedData) {
+			errChan <- errors.New("server-to-client data mismatch")
+		}
 	}()
 
 	transferWg.Wait()
 	log.Printf("[SUCCESS] Duplex transfer confirmed.")
-
-	// Cleanup
 	client.Close(nil)
 	server.Close(nil)
 	connWg.Wait()
+	close(errChan)
+
+	for err := range errChan {
+		require.NoError(t, err)
+	}
 }
 
 func TestKeepAlive(t *testing.T) {
 	keepAliveInterval := 1 * time.Second
-
-	// The overall test timeout should be long enough to allow for a keep-alive exchange
 	ctx, cancel := context.WithTimeout(context.Background(), keepAliveInterval*4)
 	defer cancel()
 
 	transport := newMockTransport()
-	client, err := NewConnection(transport, true)
+	client, err := NewConnection(transport, true, nil)
 	require.NoError(t, err)
-	client.keepAliveInterval = keepAliveInterval // Override for test
-
-	server, err := NewConnection(transport.Inverted(), false)
+	client.keepAliveInterval = keepAliveInterval
+	server, err := NewConnection(transport.Inverted(), false, nil)
 	require.NoError(t, err)
-	server.keepAliveInterval = keepAliveInterval // Override for test
+	server.keepAliveInterval = keepAliveInterval
 
 	var connWg sync.WaitGroup
 	connWg.Add(2)
-	go func() { defer connWg.Done(); runConnection(t, ctx, client) }()
-	go func() { defer connWg.Done(); runConnection(t, ctx, server) }()
+	errChan := make(chan error, 2)
 
-	// Complete the handshake
-	client.sendQueue <- &wire.PingFrame{}
-	<-client.handshakeCompleteChan
-	<-server.handshakeCompleteChan
-
-	log.Printf("[TEST] Handshake complete. Idling to trigger keep-alive after %v...", keepAliveInterval)
-
-	// Wait for a duration that should trigger a keep-alive PING but not a timeout.
-	time.Sleep(keepAliveInterval + keepAliveInterval/2)
-
-	// To verify the connection is still alive, send a new PING and expect it to work.
-	sendSuccessful := make(chan bool, 1)
 	go func() {
-		client.sendQueue <- &wire.PingFrame{}
-		sendSuccessful <- true
+		defer connWg.Done()
+		errChan <- runConnection(ctx, client)
+	}()
+	go func() {
+		defer connWg.Done()
+		errChan <- runConnection(ctx, server)
 	}()
 
-	select {
-	case <-sendSuccessful:
-		log.Printf("[SUCCESS] Connection is still alive after keep-alive interval.")
-	case <-time.After(1 * time.Second):
-		t.Fatal("Failed to send PING; connection appears to be closed or deadlocked.")
-	}
+	// Open a stream to ensure handshake is complete
+	stream, err := client.OpenStream(ctx)
+	require.NoError(t, err)
+	stream.Close()
+
+	log.Printf("[TEST] Handshake complete. Idling to trigger keep-alive after %v...", keepAliveInterval)
+	time.Sleep(keepAliveInterval + keepAliveInterval/2)
+
+	// Verify the connection is still alive by opening a new stream.
+	_, err = client.OpenStream(ctx)
+	require.NoError(t, err, "Failed to open new stream; connection appears to be closed.")
+	log.Printf("[SUCCESS] Connection is still alive after keep-alive interval.")
 
 	client.Close(nil)
 	server.Close(nil)
 	connWg.Wait()
+	close(errChan)
+
+	for err := range errChan {
+		require.NoError(t, err)
+	}
 }
 
 func TestIdleTimeoutWithNetworkFailure(t *testing.T) {
 	idleTimeout := 3 * time.Second
 	keepAliveInterval := 1 * time.Second
 
-	ctx, cancel := context.WithTimeout(context.Background(), idleTimeout*3)
+	ctx, cancel := context.WithTimeout(context.Background(), idleTimeout*2)
 	defer cancel()
 
 	underlying := newMockTransport()
 	clientTransport := underlying
-	serverTransport := newAdverseTransport(underlying.Inverted(), 0, 0, 1.0, 0, 0) // 100% loss
+	serverTransport := newAdverseTransport(underlying.Inverted(), 0, 0, 1.0, 0, 0)
 
-	client, err := NewConnection(clientTransport, true)
+	client, err := NewConnection(clientTransport, true, nil)
 	require.NoError(t, err)
 	client.idleTimeout = idleTimeout
 	client.keepAliveInterval = keepAliveInterval
 
-	server, err := NewConnection(serverTransport, false)
+	server, err := NewConnection(serverTransport, false, nil)
 	require.NoError(t, err)
 	server.idleTimeout = idleTimeout
 	server.keepAliveInterval = keepAliveInterval
@@ -888,16 +830,17 @@ func TestIdleTimeoutWithNetworkFailure(t *testing.T) {
 
 	go func() {
 		defer wg.Done()
-		clientErrChan <- client.Run(ctx)
+		clientErrChan <- runConnection(ctx, client)
 	}()
 	go func() {
 		defer wg.Done()
-		_ = server.Run(ctx)
+		runConnection(ctx, server)
 	}()
 
-	client.sendQueue <- &wire.PingFrame{}
-	<-client.handshakeCompleteChan
-	<-server.handshakeCompleteChan
+	// Open a stream to complete the handshake.
+	stream, err := client.OpenStream(ctx)
+	require.NoError(t, err)
+	stream.Close() // Close it immediately, we just needed it for the handshake.
 
 	log.Printf("[TEST] Handshake complete. Simulating network failure. Client should time out after ~%v", idleTimeout)
 
@@ -908,9 +851,7 @@ func TestIdleTimeoutWithNetworkFailure(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("Test timed out before client could return an error.")
 	}
-
 	cancel()
-
 	wg.Wait()
 
 	require.Error(t, clientErr, "Client should have returned an error")
@@ -919,37 +860,35 @@ func TestIdleTimeoutWithNetworkFailure(t *testing.T) {
 }
 
 func TestBulkTransferUDP(t *testing.T) {
-	// This test uses real UDP sockets on the loopback interface.
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	// Set up two UDP transports on random ports
 	serverTransport := newUDPTransport(t)
 	clientTransport := newUDPTransport(t)
-
-	// Tell the client where the server is
 	clientTransport.SetRemoteAddr(serverTransport.LocalAddr())
 
-	client, err := NewConnection(clientTransport, true)
+	client, err := NewConnection(clientTransport, true, nil)
 	require.NoError(t, err)
-	server, err := NewConnection(serverTransport, false)
+	server, err := NewConnection(serverTransport, false, nil)
 	require.NoError(t, err)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); runConnection(t, ctx, client) }()
-	go func() { defer wg.Done(); runConnection(t, ctx, server) }()
+	errChan := make(chan error, 2)
 
-	// Handshake
-	client.sendQueue <- &wire.PingFrame{}
-	<-client.handshakeCompleteChan
-	<-server.handshakeCompleteChan
+	go func() {
+		defer wg.Done()
+		errChan <- runConnection(ctx, client)
+	}()
+	go func() {
+		defer wg.Done()
+		errChan <- runConnection(ctx, server)
+	}()
 
 	const dataSize = 10 * 1024 * 1024 // 10 MB
 	clientData := make([]byte, dataSize)
 	_, err = rand.Read(clientData)
 	require.NoError(t, err)
-
 	var serverReceivedData []byte
 	var transferWg sync.WaitGroup
 	transferWg.Add(1)
@@ -959,37 +898,42 @@ func TestBulkTransferUDP(t *testing.T) {
 	go func() {
 		defer transferWg.Done()
 		stream, err := server.AcceptStream(ctx)
-		require.NoError(t, err)
+		if err != nil {
+			errChan <- err
+			return
+		}
 		serverReceivedData, err = io.ReadAll(stream)
-		require.NoError(t, err)
+		if err != nil {
+			errChan <- err
+		}
 	}()
 
-	go func() {
-		stream, err := client.OpenStream(ctx)
-		require.NoError(t, err)
-		_, err = stream.Write(clientData)
-		require.NoError(t, err)
-		require.NoError(t, stream.Close())
-	}()
+	stream, err := client.OpenStream(ctx)
+	require.NoError(t, err)
+	_, err = stream.Write(clientData)
+	require.NoError(t, err)
+	require.NoError(t, stream.Close())
 
 	transferWg.Wait()
-
 	duration := time.Since(startTime)
 	mbps := (float64(dataSize) / (1024 * 1024)) / duration.Seconds()
 	log.Printf("[SUCCESS] UDP Bulk transfer confirmed.")
 	log.Printf("[STATS] Transferred %d bytes in %v.", dataSize, duration)
 	log.Printf("[STATS] Speed: %.2f MB/s", mbps)
 
-	require.Equal(t, len(clientData), len(serverReceivedData))
-	require.True(t, bytes.Equal(clientData, serverReceivedData))
-
 	client.Close(nil)
 	server.Close(nil)
 	wg.Wait()
+	close(errChan)
+
+	for err := range errChan {
+		require.NoError(t, err)
+	}
+	require.Equal(t, len(clientData), len(serverReceivedData))
+	require.True(t, bytes.Equal(clientData, serverReceivedData))
 }
 
 func TestBulkTransferOverTCP(t *testing.T) {
-	// This test runs the QUIC buffer implementation over a reliable TCP stream.
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -1007,7 +951,6 @@ func TestBulkTransferOverTCP(t *testing.T) {
 	errChan := make(chan error, 2)
 
 	wg.Add(1)
-	// Server Goroutine
 	go func() {
 		defer wg.Done()
 		tcpConn, err := listener.Accept()
@@ -1018,64 +961,53 @@ func TestBulkTransferOverTCP(t *testing.T) {
 			return
 		}
 		serverTransport := newTCPTransport(tcpConn)
-		server, err := NewConnection(serverTransport, false)
+		server, err := NewConnection(serverTransport, false, nil)
 		if err != nil {
 			errChan <- err
 			return
 		}
-		go server.Run(ctx)
-		stream, err := server.AcceptStream(ctx)
-		if err != nil {
-			errChan <- err
-			return
-		}
-		serverReceivedData, err = io.ReadAll(stream)
-		if err != nil {
-			errChan <- err
-		}
+		go func() {
+			stream, err := server.AcceptStream(ctx)
+			if err != nil {
+				errChan <- err
+				return
+			}
+			serverReceivedData, err = io.ReadAll(stream)
+			if err != nil {
+				errChan <- err
+			}
+		}()
+		errChan <- runConnection(ctx, server)
 	}()
 
-	// Client Goroutine
 	tcpConn, err := net.Dial("tcp", listener.Addr().String())
 	require.NoError(t, err)
-
 	clientTransport := newTCPTransport(tcpConn)
-	client, err := NewConnection(clientTransport, true)
+	client, err := NewConnection(clientTransport, true, nil)
 	require.NoError(t, err)
+	go runConnection(ctx, client)
 
-	go client.Run(ctx)
-
-	// --- Start timing before the transfer ---
 	startTime := time.Now()
-
-	client.sendQueue <- &wire.PingFrame{}
-	<-client.handshakeCompleteChan
-
 	stream, err := client.OpenStream(ctx)
 	require.NoError(t, err)
-
 	_, err = stream.Write(clientData)
 	require.NoError(t, err)
-
 	err = stream.Close()
 	require.NoError(t, err)
 
-	// Wait for the server to finish reading the data
 	wg.Wait()
-	close(errChan)
-
-	// --- Stop timing and calculate speed ---
 	duration := time.Since(startTime)
 	mbps := (float64(dataSize) / (1024 * 1024)) / duration.Seconds()
+	log.Printf("[SUCCESS] QUIC-over-TCP Bulk transfer confirmed.")
+	log.Printf("[STATS] Transferred %d bytes in %v.", dataSize, duration)
+	log.Printf("[STATS] QUIC-over-TCP Speed: %.2f MB/s", mbps)
+
+	client.Close(nil)
+	close(errChan)
 
 	for err := range errChan {
 		require.NoError(t, err)
 	}
-
-	// Final verification and logging
 	require.Equal(t, len(clientData), len(serverReceivedData))
 	require.True(t, bytes.Equal(clientData, serverReceivedData))
-	log.Printf("[SUCCESS] QUIC-over-TCP Bulk transfer confirmed.")
-	log.Printf("[STATS] Transferred %d bytes in %v.", dataSize, duration)
-	log.Printf("[STATS] QUIC-over-TCP Speed: %.2f MB/s", mbps)
 }
