@@ -10,14 +10,18 @@ import (
 	"log"
 	mrand "math/rand"
 	"net"
+	"os"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/dozyio/quic-buffer-go/internal/wire"
 	"github.com/stretchr/testify/require"
 )
+
+func enableDebugLogging() {
+	debugLog.SetOutput(os.Stderr)
+}
 
 // mockTransport is a simple in-memory transport for testing.
 type mockTransport struct {
@@ -102,7 +106,6 @@ func (t *mockTransport) readPacketFromServer() ([]byte, error) {
 	return p, nil
 }
 
-// adverseTransport wraps a transport to simulate latency, loss, duplication, and reordering.
 type adverseTransport struct {
 	underlying    LowerLayerTransport
 	latency       time.Duration
@@ -110,18 +113,20 @@ type adverseTransport struct {
 	lossRate      float64
 	duplicateRate float64
 	reorderRate   float64
+
 	r             *mrand.Rand
 	randLock      sync.Mutex
 	reorderBuffer [][]byte
 	reorderLock   sync.Mutex
-	wg            sync.WaitGroup
-	isClosed      bool
-	mu            sync.Mutex
-	packetCounter atomic.Int64
+
+	packetQueue chan []byte
+	closeOnce   sync.Once
+	closeChan   chan struct{}
+	wg          sync.WaitGroup
 }
 
 func newAdverseTransport(underlying LowerLayerTransport, latency, jitter time.Duration, loss, duplicate, reorder float64) *adverseTransport {
-	return &adverseTransport{
+	t := &adverseTransport{
 		underlying:    underlying,
 		latency:       latency,
 		jitter:        jitter,
@@ -129,70 +134,118 @@ func newAdverseTransport(underlying LowerLayerTransport, latency, jitter time.Du
 		duplicateRate: duplicate,
 		reorderRate:   reorder,
 		r:             mrand.New(mrand.NewSource(time.Now().UnixNano())),
+		packetQueue:   make(chan []byte, 1024), // A large buffer to handle bursts
+		closeChan:     make(chan struct{}),
+	}
+	t.wg.Add(1)
+	go t.worker() // Start the single worker goroutine
+	return t
+}
+
+// worker is the single goroutine responsible for processing all outgoing packets.
+func (t *adverseTransport) worker() {
+	defer t.wg.Done()
+	for {
+		select {
+		// **THE FIX**: Prioritize the close signal. If it's received, exit immediately.
+		case <-t.closeChan:
+			// Flush any packets that were reordered before shutdown.
+			t.reorderLock.Lock()
+			for _, pkt := range t.reorderBuffer {
+				_ = t.underlying.WritePacket(pkt)
+			}
+			t.reorderBuffer = nil
+			t.reorderLock.Unlock()
+			return
+		case p, ok := <-t.packetQueue:
+			if !ok { // This case handles the channel being closed.
+				return
+			}
+			t.processPacket(p)
+		}
+	}
+}
+
+// processPacket contains the logic for delaying, dropping, duplicating, or reordering a single packet.
+func (t *adverseTransport) processPacket(p []byte) {
+	t.randLock.Lock()
+	delay := t.latency
+	if t.jitter > 0 {
+		delay += time.Duration(t.r.Int63n(int64(t.jitter)))
+	}
+	shouldDrop := t.r.Float64() < t.lossRate
+	shouldReorder := t.r.Float64() < t.reorderRate
+	shouldDuplicate := t.r.Float64() < t.duplicateRate
+	t.randLock.Unlock()
+
+	// Wait for the simulated latency, but abort if the transport is closed.
+	select {
+	case <-time.After(delay):
+	case <-t.closeChan:
+		return
+	}
+
+	if shouldDrop {
+		return
+	}
+
+	write := func(pkt []byte) {
+		// No need for a select here; if the transport is closing,
+		// the underlying write will fail or the test will end.
+		_ = t.underlying.WritePacket(pkt)
+	}
+
+	t.reorderLock.Lock()
+	// Limit the reorder buffer to prevent it from growing indefinitely.
+	if shouldReorder && len(t.reorderBuffer) < 5 {
+		t.reorderBuffer = append(t.reorderBuffer, p)
+		if len(t.reorderBuffer) > 1 {
+			// Send the oldest packet from the buffer.
+			pktToSend := t.reorderBuffer[0]
+			t.reorderBuffer = t.reorderBuffer[1:]
+			t.reorderLock.Unlock()
+			write(pktToSend)
+			return
+		}
+		t.reorderLock.Unlock()
+		return
+	}
+	t.reorderLock.Unlock()
+
+	write(p)
+
+	if shouldDuplicate {
+		// Wait a bit before sending the duplicate.
+		select {
+		case <-time.After(5 * time.Millisecond):
+			write(p)
+		case <-t.closeChan:
+			return
+		}
 	}
 }
 
 func (t *adverseTransport) WritePacket(p []byte) error {
-	t.mu.Lock()
-	if t.isClosed {
-		t.mu.Unlock()
+	// Check if closed before attempting to write to the queue.
+	select {
+	case <-t.closeChan:
 		return io.EOF
+	default:
 	}
-	t.wg.Add(1)
-	t.mu.Unlock()
 
 	pCopy := make([]byte, len(p))
 	copy(pCopy, p)
-	packetNum := t.packetCounter.Add(1)
 
-	go func() {
-		defer t.wg.Done()
-
-		// Allow handshake
-		if packetNum <= 4 {
-			t.underlying.WritePacket(pCopy)
-			return
-		}
-
-		t.randLock.Lock()
-		delay := t.latency
-		if t.jitter > 0 {
-			delay += time.Duration(t.r.Int63n(int64(t.jitter)))
-		}
-		shouldDrop := t.r.Float64() < t.lossRate
-		shouldReorder := t.r.Float64() < t.reorderRate
-		shouldDuplicate := t.r.Float64() < t.duplicateRate
-		t.randLock.Unlock()
-
-		time.Sleep(delay)
-
-		if shouldDrop {
-			return
-		}
-
-		isHandshake := packetNum <= 4
-
-		t.reorderLock.Lock()
-		if !isHandshake && shouldReorder {
-			t.reorderBuffer = append(t.reorderBuffer, pCopy)
-			if len(t.reorderBuffer) > 1 {
-				pktToSend := t.reorderBuffer[0]
-				t.reorderBuffer = t.reorderBuffer[1:]
-				t.underlying.WritePacket(pktToSend)
-			}
-			t.reorderLock.Unlock()
-			return
-		}
-		t.reorderLock.Unlock()
-
-		t.underlying.WritePacket(pCopy)
-
-		if !isHandshake && shouldDuplicate {
-			time.Sleep(5 * time.Millisecond)
-			t.underlying.WritePacket(pCopy)
-		}
-	}()
-	return nil
+	// Try to queue the packet, but drop it if the queue is full (non-blocking).
+	select {
+	case t.packetQueue <- pCopy:
+		return nil
+	case <-t.closeChan:
+		return io.EOF
+	default:
+		// Drop the packet if the queue is full, simulating network congestion.
+		return nil
+	}
 }
 
 func (t *adverseTransport) ReadPacket() ([]byte, error) {
@@ -200,21 +253,12 @@ func (t *adverseTransport) ReadPacket() ([]byte, error) {
 }
 
 func (t *adverseTransport) Close() error {
-	t.mu.Lock()
-	if t.isClosed {
-		t.mu.Unlock()
-		return nil
-	}
-	t.isClosed = true
-	t.mu.Unlock()
-	t.wg.Wait()
-	t.reorderLock.Lock()
-	defer t.reorderLock.Unlock()
-	for _, p := range t.reorderBuffer {
-		t.underlying.WritePacket(p)
-	}
-	t.reorderBuffer = nil
-	return t.underlying.Close()
+	t.closeOnce.Do(func() {
+		close(t.closeChan)   // Signal the worker to stop.
+		t.wg.Wait()          // Wait for the worker to acknowledge and exit.
+		t.underlying.Close() // Now, safely close the underlying transport.
+	})
+	return nil
 }
 
 // udpTransport is a transport layer that uses a real UDP socket.
@@ -1081,18 +1125,21 @@ func TestBulkTransferOverTCP(t *testing.T) {
 }
 
 func TestDeadlockOnRetransmission(t *testing.T) {
+	// enableDebugLogging()
+
 	// The test will hang and fail due to this timeout.
 	// When it fails, check the goroutine stack traces in the test output
 	// to see the circular lock dependency.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	clientUnderlying, serverUnderlying := newInMemoryTransportPair()
+
 	// Use an adverse transport to simulate high packet loss.
 	// Low latency ensures a fast feedback loop, increasing lock contention.
 	const lossRate = 0.3 // 30% packet loss is very aggressive
-	underlying := newMockTransport()
-	clientTransport := newAdverseTransport(underlying, 5*time.Millisecond, 0, lossRate, 0, 0)
-	serverTransport := newAdverseTransport(underlying.Inverted(), 5*time.Millisecond, 0, lossRate, 0, 0)
+	clientTransport := newAdverseTransport(clientUnderlying, 5*time.Millisecond, 0, lossRate, 0, 0)
+	serverTransport := newAdverseTransport(serverUnderlying, 5*time.Millisecond, 0, lossRate, 0, 0)
 
 	client, err := NewConnection(clientTransport, true)
 	require.NoError(t, err)

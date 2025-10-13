@@ -60,18 +60,26 @@ func newInMemoryTransportPair() (LowerLayerTransport, LowerLayerTransport) {
 }
 
 func (t *inMemoryTransport) WritePacket(pkt []byte) error {
+	// Perform a non-blocking check for closure first.
+	// This prevents a race where the channel closes between the start of the
+	// select and a blocking write being chosen.
 	select {
 	case <-t.closer.closed:
 		return errors.New("transport closed")
 	default:
+		// Not closed, continue.
 	}
-	// Make a copy to prevent race conditions if the sender reuses the buffer.
+
 	pktCopy := make([]byte, len(pkt))
 	copy(pktCopy, pkt)
+
 	select {
 	case <-t.closer.closed:
 		return errors.New("transport closed")
 	case t.writeChan <- pktCopy:
+		return nil
+	default:
+		// Dropping the packet is the correct simulation of a full UDP buffer.
 		return nil
 	}
 }
