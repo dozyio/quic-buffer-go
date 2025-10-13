@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 	"sync"
 	"time"
 
@@ -74,6 +75,8 @@ type Connection struct {
 	keepAliveInterval      time.Duration
 	lastPacketReceivedTime time.Time
 	keepAlivePingSent      bool
+	closeOnce              sync.Once
+	closeErr               error
 }
 
 func NewConnection(transport LowerLayerTransport, isClient bool) (*Connection, error) {
@@ -136,7 +139,7 @@ func (c *Connection) Run(ctx context.Context) error {
 		// This goroutine runs until the connection's internal c.ctx is canceled.
 		err := c.receiveLoop(c.ctx)
 		// Don't send an error if it's a standard closure.
-		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 			errChan <- err
 		} else {
 			errChan <- nil // Signal graceful exit
@@ -145,29 +148,29 @@ func (c *Connection) Run(ctx context.Context) error {
 
 	go func() {
 		err := c.sendLoop(c.ctx)
-		if err != nil && !errors.Is(err, context.Canceled) {
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
 			errChan <- err
 		} else {
 			errChan <- nil // Signal graceful exit
 		}
 	}()
 
-	// Wait for the first of the two loops to exit.
-	err := <-errChan
+	// Wait for the first loop to exit, which will trigger a close.
+	firstErr := <-errChan
 	// Now that one loop has exited (likely by calling c.Close), the other will exit shortly.
 	// Calling c.Close() ensures a clean shutdown if the exit was triggered by the external context.
-	c.Close(err)
+	c.Close(firstErr)
 
 	// Wait for the second loop to finish exiting.
 	<-errChan
 
-	// If the test context was canceled, that's the primary reason for shutdown.
+	// If the external context was canceled, that's the primary reason for shutdown.
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 
-	// Otherwise, return the actual error from the loop (which could be nil).
-	return err
+	// Return the error that initiated the close.
+	return c.closeErr
 }
 
 func (c *Connection) receiveLoop(ctx context.Context) error {
@@ -587,6 +590,10 @@ func (c *Connection) sendStreamData(id protocol.StreamID, data []byte, fin bool,
 }
 
 func (c *Connection) Close(err error) {
+	c.closeOnce.Do(func() {
+		c.closeErr = err
+	})
+
 	c.cancel()
 	c.transport.Close()
 	c.streamsMu.RLock()

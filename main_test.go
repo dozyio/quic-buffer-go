@@ -344,7 +344,7 @@ func (r *pacedReader) Read(p []byte) (n int, err error) {
 	if err == nil {
 		time.Sleep(r.delay)
 	}
-	return
+	return n, err
 }
 
 func TestTextMessageTransfer(t *testing.T) {
@@ -709,8 +709,8 @@ func TestExtremeLatencyVariation(t *testing.T) {
 func runConnection(t testing.TB, ctx context.Context, conn *Connection) {
 	t.Helper()
 	err := conn.Run(ctx)
-	// We expect the context to be canceled or the deadline to be exceeded in a normal test shutdown.
 	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, io.EOF) {
+		// We expect the context to be canceled or the deadline to be exceeded in a normal test shutdown.
 		require.NoError(t, err, "connection run loop failed unexpectedly")
 	}
 }
@@ -1078,4 +1078,77 @@ func TestBulkTransferOverTCP(t *testing.T) {
 	log.Printf("[SUCCESS] QUIC-over-TCP Bulk transfer confirmed.")
 	log.Printf("[STATS] Transferred %d bytes in %v.", dataSize, duration)
 	log.Printf("[STATS] QUIC-over-TCP Speed: %.2f MB/s", mbps)
+}
+
+func TestDeadlockOnRetransmission(t *testing.T) {
+	// The test will hang and fail due to this timeout.
+	// When it fails, check the goroutine stack traces in the test output
+	// to see the circular lock dependency.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Use an adverse transport to simulate high packet loss.
+	// Low latency ensures a fast feedback loop, increasing lock contention.
+	const lossRate = 0.3 // 30% packet loss is very aggressive
+	underlying := newMockTransport()
+	clientTransport := newAdverseTransport(underlying, 5*time.Millisecond, 0, lossRate, 0, 0)
+	serverTransport := newAdverseTransport(underlying.Inverted(), 5*time.Millisecond, 0, lossRate, 0, 0)
+
+	client, err := NewConnection(clientTransport, true)
+	require.NoError(t, err)
+	server, err := NewConnection(serverTransport, false)
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); client.Run(ctx) }()
+	go func() { defer wg.Done(); server.Run(ctx) }()
+
+	// Handshake
+	client.sendQueue <- &wire.PingFrame{}
+	<-client.handshakeCompleteChan
+	<-server.handshakeCompleteChan
+	log.Println("[TEST] Handshake complete. Starting high-contention data transfer...")
+
+	// Server: Continuously read and discard data to keep the flow control window open.
+	go func() {
+		stream, err := server.AcceptStream(ctx)
+		if err != nil {
+			return // Context was canceled, which is expected
+		}
+		// io.Copy will block until the stream is closed or an error occurs.
+		_, _ = io.Copy(io.Discard, stream)
+	}()
+
+	// Client: Continuously write data in a loop to keep the sendQueue full
+	// and the sendLoop constantly active. This sustained pressure is key
+	// to triggering the deadlock.
+	go func() {
+		stream, err := client.OpenStream(ctx)
+		require.NoError(t, err)
+		defer stream.Close()
+
+		// Send small chunks of data in a tight loop.
+		// This ensures the sendLoop is always busy trying to pack and send packets,
+		// while the receiveLoop is simultaneously processing ACKs and detecting losses.
+		dataChunk := make([]byte, 1024)
+		for {
+			select {
+			case <-ctx.Done(): // Stop sending when the test times out.
+				return
+			default:
+				_, err := stream.Write(dataChunk)
+				if err != nil {
+					// An error is expected here when the connection closes.
+					return
+				}
+			}
+		}
+	}()
+
+	// The test will now simply wait.
+	// If the deadlock exists, the client and server goroutines will get stuck.
+	// The context timeout will fire, canceling everything and causing the test to fail.
+	// The Go runtime will then print the goroutine stacks, revealing the deadlock.
+	wg.Wait()
 }
