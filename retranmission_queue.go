@@ -22,8 +22,9 @@ func newRetransmissionQueue(conn *Connection) *retransmissionQueue {
 
 func (q *retransmissionQueue) Add(f wire.Frame) {
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	q.appData = append(q.appData, f)
+	q.mu.Unlock()
+	q.conn.scheduleSending()
 }
 
 func (q *retransmissionQueue) HasData() bool {
@@ -43,6 +44,17 @@ func (q *retransmissionQueue) GetFrame() wire.Frame {
 	return f
 }
 
+func (q *retransmissionQueue) Drain() []wire.Frame {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.appData) == 0 {
+		return nil
+	}
+	frames := q.appData
+	q.appData = nil
+	return frames
+}
+
 func (q *retransmissionQueue) FrameHandler(encLevel protocol.EncryptionLevel) ackhandler.FrameHandler {
 	return (*retransmissionQueueAckHandler)(q)
 }
@@ -52,5 +64,5 @@ type retransmissionQueueAckHandler retransmissionQueue
 func (q *retransmissionQueueAckHandler) OnAcked(wire.Frame) {}
 
 func (q *retransmissionQueueAckHandler) OnLost(f wire.Frame) {
-	(*retransmissionQueue)(q).Add(f)
+	go (*retransmissionQueue)(q).Add(f)
 }

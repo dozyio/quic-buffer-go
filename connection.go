@@ -136,6 +136,14 @@ func (c *Connection) Run(ctx context.Context) error {
 	errChan := make(chan error, 2)
 
 	go func() {
+		select {
+		case <-ctx.Done():
+			c.Close(ctx.Err())
+		case <-c.ctx.Done():
+		}
+	}()
+
+	go func() {
 		// This goroutine runs until the connection's internal c.ctx is canceled.
 		err := c.receiveLoop(c.ctx)
 		// Don't send an error if it's a standard closure.
@@ -394,10 +402,14 @@ func (c *Connection) sendPackets() error {
 	if ack := c.receivedPacketHandler.GetAckFrame(protocol.Encryption1RTT, time.Now(), false); ack != nil {
 		oneRTTFrames = append(oneRTTFrames, ack)
 	}
+	retransmissionFrames := c.retransmissionQueue.Drain()
+
 	c.ackMu.Unlock()
-	for c.retransmissionQueue.HasData() {
-		oneRTTFrames = append(oneRTTFrames, c.retransmissionQueue.GetFrame())
+
+	if len(retransmissionFrames) > 0 {
+		oneRTTFrames = append(oneRTTFrames, retransmissionFrames...)
 	}
+
 DrainNewData:
 	for {
 		select {
